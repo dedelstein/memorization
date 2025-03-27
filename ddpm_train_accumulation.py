@@ -38,8 +38,8 @@ class EMA:
             for s_param, param in zip(self.shadow_params, target_model.parameters()):
                 param.copy_(s_param)
 
-def train(model, diffusion, train_dataloader, val_dataloader, optimizer, device, num_epochs=100, ema_decay=CONFIG["ema_decay"], 
-         amp_enabled=CONFIG["amp"], scheduler=None, save_dir="checkpoints", class_embed=None, gradient_accumulation_steps=4):
+def train(model, diffusion, train_dataloader, val_dataloader, optimizer, num_epochs=100, ema_decay=CONFIG["ema_decay"], 
+          scheduler=None, save_dir="checkpoints", class_embed=None, gradient_accumulation_steps=4):
     """Train the diffusion model.
     
     Args:
