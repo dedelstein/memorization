@@ -1,11 +1,13 @@
-import os
 import torch
-
+import os
+import neptune
 from tqdm import tqdm
+from dotenv import load_dotenv
+from accelerate import Accelerator
+
 from config import CONFIG
 from ddpm import Diffusion, create_model, generate_samples
 from util import prepare_dataloaders
-
 
 class EMA:
     """Exponential Moving Average for model parameters."""
@@ -38,93 +40,112 @@ class EMA:
                 param.copy_(s_param)
 
 def train(model, diffusion, train_dataloader, val_dataloader, optimizer, device, num_epochs=100, ema_decay=CONFIG["ema_decay"], 
-         amp_enabled=CONFIG["amp"], scheduler=None, save_dir="checkpoints", class_embed=None):
-    """Train the diffusion model.
+         amp_enabled=CONFIG["amp"], scheduler=None, save_dir="checkpoints", class_embed=None, run=None, gradient_accumulation_steps=4):
+    """Train the diffusion model."""
+    accelerator = Accelerator(gradient_accumulation_steps=gradient_accumulation_steps)
     
-    Args:
-        model: UNet model
-        diffusion: Diffusion process
-        dataloader: Training data loader
-        optimizer: Optimizer
-        device: Device to run on
-        num_epochs: Number of training epochs
-        ema_decay: EMA decay rate
-        amp_enabled: Whether to use mixed precision training
-        scheduler: Learning rate scheduler
-        
-    Returns:
-        Trained model
-    """
-    model.train()
+    model, optimizer, train_dataloader, val_dataloader = accelerator.prepare(
+        model, optimizer, train_dataloader, val_dataloader
+    )
+    if class_embed is not None:
+        class_embed = accelerator.prepare(class_embed)
+    
     ema = EMA(model, decay=ema_decay)
-    scaler = torch.GradScaler() if amp_enabled else None
-
     os.makedirs(save_dir, exist_ok=True)
     best_loss = float('inf')
 
     for epoch in range(num_epochs):
         total_loss = 0.0
         with tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{num_epochs}") as pbar:
-            for batch in pbar:
-                x, y = batch
-                x = x.to(device)
-                y = y.to(device)
-                
-                t = torch.randint(0, diffusion.steps, (x.shape[0],), device=device)
-                optimizer.zero_grad()
-                
-                if amp_enabled:
-                    with torch.autocast(device_type=device.type):
-                        loss = diffusion.train_step(x, t, y)
-                    scaler.scale(loss).backward()
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
+            for batch_idx, batch in enumerate(pbar):
+                with accelerator.accumulate(model):
+                    x, y = batch
+                    
+                    t = torch.randint(0, diffusion.steps, (x.shape[0],), device=accelerator.device)
                     loss = diffusion.train_step(x, t, y)
-                    loss.backward()
-                    optimizer.step()
-                
-                ema.update()
-                total_loss += loss.item()
-                pbar.set_postfix({"loss": f"{loss.item():.6f}"})
+                    
+                    accelerator.backward(loss)
+                    
+                    if ((batch_idx + 1) % gradient_accumulation_steps == 0 or 
+                        batch_idx == len(train_dataloader) - 1):
+                        optimizer.step()
+                        optimizer.zero_grad()
+                        ema.update()
+                    
+                    total_loss += loss.item()
+                    pbar.set_postfix({"loss": f"{loss.item():.6f}"})
+                    
+                    if run is not None:
+                        run["train/batch_loss"].log(loss.item(), step=epoch * len(train_dataloader) + batch_idx)
         
         if scheduler is not None:
             scheduler.step()
         
         avg_train_loss = total_loss / len(train_dataloader)
-        val_loss = validate(model, diffusion, val_dataloader, device)
+        val_loss = validate(model, diffusion, val_dataloader, accelerator.device)
         print(f"Epoch {epoch+1}/{num_epochs}, Avg Train Loss: {avg_train_loss:.6f}, Val Loss: {val_loss:.6f}")
         
+        if run is not None:
+            run["train/epoch"].log(epoch + 1)
+            run["train/avg_loss"].log(avg_train_loss)
+            run["validation/loss"].log(val_loss)
+            run["train/learning_rate"].log(optimizer.param_groups[0]['lr'])
+        
+        unwrapped_model = accelerator.unwrap_model(model)
         checkpoint = {
             'epoch': epoch + 1,
-            'model_state_dict': model.state_dict(),
+            'model_state_dict': unwrapped_model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'train_loss': avg_train_loss,
             'val_loss': val_loss,
         }
         
         if class_embed is not None:
-            checkpoint['class_embed_state_dict'] = class_embed.state_dict()
+            unwrapped_class_embed = accelerator.unwrap_model(class_embed)
+            checkpoint['class_embed_state_dict'] = unwrapped_class_embed.state_dict()
         
-        torch.save(checkpoint, os.path.join(save_dir, f'model_epoch_{epoch+1}.pt'))
- 
+        checkpoint_path = os.path.join(save_dir, f'model_epoch_{epoch+1}.pt')
+        torch.save(checkpoint, checkpoint_path)
+        
         if val_loss < best_loss:
             best_loss = val_loss
-            torch.save(checkpoint, os.path.join(save_dir, 'best_model.pt'))
+            best_model_path = os.path.join(save_dir, 'best_model.pt')
+            torch.save(checkpoint, best_model_path)
+            
+            if run is not None:
+                run["validation/best_loss"] = best_loss
+                run["models/best_model"].upload(best_model_path)
+        
+        if (epoch + 1) % 10 == 0 or epoch == 0:
+            samples = generate_samples(diffusion, accelerator.device, epoch+1)
+            
+            if run is not None:
+                for i, sample in enumerate(samples):
+                    sample_path = os.path.join(save_dir, f'sample_{epoch+1}_{i}.png')
+                    sample_img = sample.permute(1, 2, 0).cpu().numpy()
+                    import matplotlib.pyplot as plt
+                    plt.imsave(sample_path, sample_img)
+                    run[f"samples/epoch_{epoch+1}"].upload(sample_path)
     
+    unwrapped_model = accelerator.unwrap_model(model)
     final_checkpoint = {
         'epoch': num_epochs,
-        'model_state_dict': model.state_dict(),
+        'model_state_dict': unwrapped_model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'train_loss': avg_train_loss,
         'val_loss': val_loss,
     }
     if class_embed is not None:
-        final_checkpoint['class_embed_state_dict'] = class_embed.state_dict()
+        unwrapped_class_embed = accelerator.unwrap_model(class_embed)
+        final_checkpoint['class_embed_state_dict'] = unwrapped_class_embed.state_dict()
     
-    torch.save(final_checkpoint, os.path.join(save_dir, 'final_model.pt'))
+    final_model_path = os.path.join(save_dir, 'final_model.pt')
+    torch.save(final_checkpoint, final_model_path)
     
-    return model
+    if run is not None:
+        run["models/final_model"].upload(final_model_path)
+    
+    return accelerator.unwrap_model(model)
 
 def validate(model, diffusion, dataloader, device):
     """Evaluate the diffusion model on validation data."""
@@ -134,8 +155,6 @@ def validate(model, diffusion, dataloader, device):
     with torch.no_grad():
         for batch in dataloader:
             x, y = batch
-            x = x.to(device)
-            y = y.to(device)
             
             t = torch.randint(0, diffusion.steps, (x.shape[0],), device=device)
             loss = diffusion.train_step(x, t, y)
@@ -143,14 +162,29 @@ def validate(model, diffusion, dataloader, device):
     
     return total_loss / len(dataloader)
 
-
 def main():
-    """Main function to set up and train the diffusion model.
-    
-    Returns:
-        Tuple of (model, diffusion, class_embed)
-    """
+    """Main function to set up and train the diffusion model."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    load_dotenv()
+
+    NEPTUNE_API_TOKEN = os.getenv('NEPTUNE_API_TOKEN')
+    
+    run = neptune.init_run(
+        project="dedelstein/Memorization",
+        api_token=NEPTUNE_API_TOKEN,
+        tags=["diffusion-model"],
+        capture_hardware_metrics=True,
+    )
+    
+    for key, value in CONFIG.items():
+        run["parameters/config"][key] = value
+    
+    run["parameters/optimizer"] = "AdamW"
+    run["parameters/lr"] = 1e-4
+    run["parameters/weight_decay"] = 1e-5
+    run["parameters/scheduler"] = "CosineAnnealingLR"
+    run["parameters/gradient_accumulation_steps"] = 4
     
     model, class_embed = create_model(
         device=device,
@@ -159,7 +193,6 @@ def main():
     )
     
     # Example of loading a pre-trained classifier
-    # Replace this with your own classifier
     # classifier = YourClassifierModel().to(device)
     # classifier.load_state_dict(torch.load("path_to_classifier_weights.pth"))
     # classifier.eval()  # Set to evaluation mode
@@ -185,13 +218,13 @@ def main():
         lr=1e-4,
         weight_decay=1e-5
     )
-
+    
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, 
         T_max=100
     )
     
-    # Create a dataloader, this is a toy example
+    # Create a dataloader - this is a toy example
     from torchvision import datasets, transforms
     transform = transforms.Compose([
         transforms.ToTensor(),
@@ -217,8 +250,12 @@ def main():
         num_epochs=100,
         scheduler=scheduler,
         save_dir="checkpoints",
-        class_embed=class_embed
+        class_embed=class_embed,
+        run=run,
+        gradient_accumulation_steps=4
     )
+    
+    run.stop()
     
     return model, diffusion, class_embed
 

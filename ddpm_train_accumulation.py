@@ -5,6 +5,7 @@ from tqdm import tqdm
 from config import CONFIG
 from ddpm import Diffusion, create_model, generate_samples
 from util import prepare_dataloaders
+from accelerate import Accelerator
 
 
 class EMA:
@@ -38,7 +39,7 @@ class EMA:
                 param.copy_(s_param)
 
 def train(model, diffusion, train_dataloader, val_dataloader, optimizer, device, num_epochs=100, ema_decay=CONFIG["ema_decay"], 
-         amp_enabled=CONFIG["amp"], scheduler=None, save_dir="checkpoints", class_embed=None):
+         amp_enabled=CONFIG["amp"], scheduler=None, save_dir="checkpoints", class_embed=None, gradient_accumulation_steps=4):
     """Train the diffusion model.
     
     Args:
@@ -55,56 +56,58 @@ def train(model, diffusion, train_dataloader, val_dataloader, optimizer, device,
     Returns:
         Trained model
     """
-    model.train()
+    accelerator = Accelerator(gradient_accumulation_steps=gradient_accumulation_steps)
+    
+    model, optimizer, train_dataloader, val_dataloader = accelerator.prepare(
+        model, optimizer, train_dataloader, val_dataloader
+    )
+    if class_embed is not None:
+        class_embed = accelerator.prepare(class_embed)
+    
     ema = EMA(model, decay=ema_decay)
-    scaler = torch.GradScaler() if amp_enabled else None
-
     os.makedirs(save_dir, exist_ok=True)
     best_loss = float('inf')
 
     for epoch in range(num_epochs):
         total_loss = 0.0
         with tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{num_epochs}") as pbar:
-            for batch in pbar:
-                x, y = batch
-                x = x.to(device)
-                y = y.to(device)
-                
-                t = torch.randint(0, diffusion.steps, (x.shape[0],), device=device)
-                optimizer.zero_grad()
-                
-                if amp_enabled:
-                    with torch.autocast(device_type=device.type):
-                        loss = diffusion.train_step(x, t, y)
-                    scaler.scale(loss).backward()
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
+            for step, batch in enumerate(pbar):
+                with accelerator.accumulate(model):
+                    x, y = batch
+                    
+                    t = torch.randint(0, diffusion.steps, (x.shape[0],), device=accelerator.device)
                     loss = diffusion.train_step(x, t, y)
-                    loss.backward()
-                    optimizer.step()
-                
-                ema.update()
-                total_loss += loss.item()
-                pbar.set_postfix({"loss": f"{loss.item():.6f}"})
+                    
+                    accelerator.backward(loss)
+                    
+                    if ((step + 1) % gradient_accumulation_steps == 0 or 
+                        step == len(train_dataloader) - 1):
+                        optimizer.step()
+                        optimizer.zero_grad()
+                        ema.update()
+                    
+                    total_loss += loss.item()
+                    pbar.set_postfix({"loss": f"{loss.item():.6f}"})
         
         if scheduler is not None:
             scheduler.step()
         
         avg_train_loss = total_loss / len(train_dataloader)
-        val_loss = validate(model, diffusion, val_dataloader, device)
+        val_loss = validate(model, diffusion, val_dataloader, accelerator.device)
         print(f"Epoch {epoch+1}/{num_epochs}, Avg Train Loss: {avg_train_loss:.6f}, Val Loss: {val_loss:.6f}")
         
+        unwrapped_model = accelerator.unwrap_model(model)
         checkpoint = {
             'epoch': epoch + 1,
-            'model_state_dict': model.state_dict(),
+            'model_state_dict': unwrapped_model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'train_loss': avg_train_loss,
             'val_loss': val_loss,
         }
         
         if class_embed is not None:
-            checkpoint['class_embed_state_dict'] = class_embed.state_dict()
+            unwrapped_class_embed = accelerator.unwrap_model(class_embed)
+            checkpoint['class_embed_state_dict'] = unwrapped_class_embed.state_dict()
         
         torch.save(checkpoint, os.path.join(save_dir, f'model_epoch_{epoch+1}.pt'))
  
@@ -112,19 +115,21 @@ def train(model, diffusion, train_dataloader, val_dataloader, optimizer, device,
             best_loss = val_loss
             torch.save(checkpoint, os.path.join(save_dir, 'best_model.pt'))
     
+    unwrapped_model = accelerator.unwrap_model(model)
     final_checkpoint = {
         'epoch': num_epochs,
-        'model_state_dict': model.state_dict(),
+        'model_state_dict': unwrapped_model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'train_loss': avg_train_loss,
         'val_loss': val_loss,
     }
     if class_embed is not None:
-        final_checkpoint['class_embed_state_dict'] = class_embed.state_dict()
+        unwrapped_class_embed = accelerator.unwrap_model(class_embed)
+        final_checkpoint['class_embed_state_dict'] = unwrapped_class_embed.state_dict()
     
     torch.save(final_checkpoint, os.path.join(save_dir, 'final_model.pt'))
     
-    return model
+    return accelerator.unwrap_model(model)
 
 def validate(model, diffusion, dataloader, device):
     """Evaluate the diffusion model on validation data."""
@@ -133,9 +138,11 @@ def validate(model, diffusion, dataloader, device):
     
     with torch.no_grad():
         for batch in dataloader:
-            x, y = batch
-            x = x.to(device)
-            y = y.to(device)
+            if isinstance(batch, (tuple, list)):
+                x, y = batch
+            else:
+                x = batch
+                y = None
             
             t = torch.randint(0, diffusion.steps, (x.shape[0],), device=device)
             loss = diffusion.train_step(x, t, y)
@@ -217,7 +224,8 @@ def main():
         num_epochs=100,
         scheduler=scheduler,
         save_dir="checkpoints",
-        class_embed=class_embed
+        class_embed=class_embed,
+        gradient_accumulation_steps=4
     )
     
     return model, diffusion, class_embed
