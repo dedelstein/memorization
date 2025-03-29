@@ -34,10 +34,9 @@ class CheXpertDataset(Dataset):
             class_index (list, optional): Which classes to use (defaults to all 14).
             use_frontal (bool): Whether to use only frontal X-rays.
         """
-        self.metadata = use_metadata
+        self.use_metadata = use_metadata
 
         self.data_frame = pd.read_csv(csv_file)
-        self.data_frame = self.data_frame.drop("Path", axis=1)
 
         # -------------------
         # Filter and clean df
@@ -52,15 +51,16 @@ class CheXpertDataset(Dataset):
 
         # Frontal, AP/PA - AP/PA in (0 - None, 1 - AP, 2 - PA)
         self.data_frame["AP/PA"] = self.data_frame["AP/PA"].apply(lambda x: 1 if x == "AP" else 2 if x == "PA" else 0)
+        self.data_frame["Frontal/Lateral"] = self.data_frame["Frontal/Lateral"].apply(lambda x: 1 if x == "Frontal" else 0)
 
+        # Apply frontal filtering if requested
         if use_frontal:
-            self.data_frame = self.data_frame[self.data_frame["Frontal/Lateral"] == "Frontal"]
-        else:
-            self.data_frame["Frontal/Lateral"] = self.data_frame["Frontal/Lateral"].apply(lambda x: 1 if x == "Frontal" else 0)
+            self.data_frame = self.data_frame[self.data_frame["Frontal/Lateral"] == 1]
 
         # Replace all NaN values in findings with 0 - we have 0 as negative here
         # Not sure if this is ideal, some discussion in the slack
         self.data_frame= self.data_frame.fillna(0)
+        self.data_frame = self.data_frame.reset_index(drop=True)
         # -------------------
 
         self.root_dir = root_dir
@@ -105,14 +105,10 @@ class CheXpertDataset(Dataset):
         if torch.is_tensor(idx):
             idx = idx.tolist()
             
-        img_path = os.path.join(self.root_dir, self.data_frame.loc[idx, "Path"])
+        img_path = self.data_frame.iloc[idx]["Path"].replace("CheXpert-v1.0-small/", "")
+        img_path = os.path.join(self.root_dir, img_path)
         
-        try:
-            image = Image.open(img_path).convert('L')
-        except Exception as e:
-            print(f"Error loading image {img_path}: {e}")
-            placeholder = np.zeros((224, 224), dtype=np.uint8)
-            image = Image.fromarray(placeholder)
+        image = Image.open(img_path).convert('L')
             
         if self.transform:
             image = self.transform(image)
@@ -123,7 +119,7 @@ class CheXpertDataset(Dataset):
         )
 
         # If you want Age, Sex, F/L, AP/PA
-        if self.metadata:
+        if self.use_metadata:
             metadata =  torch.tensor(
                 self.data_frame.loc[idx, self.metadata].values.astype(np.float32)
             )
@@ -144,24 +140,23 @@ def get_chexpert_dataloaders(root_dir, batch_size=32, policy='ones', class_index
         class_index (list, optional): Which classes to use (defaults to all 14).
         use_frontal (bool): Whether to use only frontal X-rays.
         num_workers (int): Number of workers for data loading.
-        include_test (bool): Whether to include test set loader.
         
     Returns:
-        train_loader, val_loader, test_loader: DataLoader objects for training, validation and test.
-        Note: test_loader will be None if include_test is False or test.csv doesn't exist.
+        train_loader, val_loader: DataLoader objects for training, validation."
     """
+    
     train_transform = transforms.Compose([
         transforms.Resize((224, 224)),
     #   transforms.RandomHorizontalFlip(),
     #   transforms.RandomRotation(10),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5], std=[0.5])
+        transforms.Normalize(mean=[0.5], std=[0.3])
     ])
     
     val_transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5], std=[0.5])
+        transforms.Normalize(mean=[0.5], std=[0.3])
     ])
     
     train_csv = os.path.join(root_dir, 'train.csv')

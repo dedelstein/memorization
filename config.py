@@ -10,5 +10,5 @@ CONFIG = {
     "image_size": 32,
     "use_conditional_unet": True,
     "guidance_method": "classifier-free",  # "classifier-free" or "classifier"
-    "data_dir": "./data"
+    "data_dir": "./CheXpert-v1.0-small"
 }
