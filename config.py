@@ -9,5 +9,6 @@ CONFIG = {
     "amp": True,
     "image_size": 32,
     "use_conditional_unet": True,
-    "guidance_method": "classifier-free"  # "classifier-free" or "classifier"
+    "guidance_method": "classifier-free",  # "classifier-free" or "classifier"
+    "data_dir": "./data"
 }

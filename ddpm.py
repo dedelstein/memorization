@@ -4,6 +4,7 @@ import math
 from tqdm import tqdm
 from diffusers import UNet2DModel, UNet2DConditionModel
 import torch.nn as nn
+
 from config import CONFIG
 
 class ClassEmbedding(nn.Module):

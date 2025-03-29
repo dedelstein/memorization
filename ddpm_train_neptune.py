@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 
 from config import CONFIG
 from ddpm import Diffusion, create_model, generate_samples
-from util import prepare_dataloaders
+from util import get_chexpert_dataloaders
 
 class EMA:
     """Exponential Moving Average for model parameters."""
@@ -234,7 +234,7 @@ def main():
     val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=64, shuffle=False, num_workers=4)
 
     # Prepare dataloaders
-    # train_loader, val_loader, _ = prepare_dataloaders(batch_size=64, val_batch_size=32)
+    # train_loader, val_loader = get_chexpert_dataloaders(CONFIG["data_dir"])
 
     model = train(
         model=model,
