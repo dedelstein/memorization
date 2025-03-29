@@ -24,7 +24,7 @@ class CheXpertDataset(Dataset):
     CheXpert dataset class for PyTorch
     """
     def __init__(self, csv_file, root_dir, transform=None, policy='ones', 
-                 class_index=None, use_frontal=True):
+                 class_index=None, use_frontal=True, use_metadata=True):
         """
         Args:
             csv_file (string): Path to the CSV file with annotations.
@@ -34,8 +34,10 @@ class CheXpertDataset(Dataset):
             class_index (list, optional): Which classes to use (defaults to all 14).
             use_frontal (bool): Whether to use only frontal X-rays.
         """
+        self.metadata = use_metadata
+
         self.data_frame = pd.read_csv(csv_file)
-        self.data_frame = self.data_frame.drop("Path", axis=0)
+        self.data_frame = self.data_frame.drop("Path", axis=1)
 
         # -------------------
         # Filter and clean df
@@ -114,25 +116,24 @@ class CheXpertDataset(Dataset):
             
         if self.transform:
             image = self.transform(image)
-            
+
+        # Feature only labels    
         labels = torch.tensor(
             self.data_frame.loc[idx, self.classes].values.astype(np.float32)
         )
 
-        metadata =  torch.tensor(
-            self.data_frame.loc[idx, self.metadata].values.astype(np.float32)
-        )
+        # If you want Age, Sex, F/L, AP/PA
+        if self.metadata:
+            metadata =  torch.tensor(
+                self.data_frame.loc[idx, self.metadata].values.astype(np.float32)
+            )
+            labels = torch.cat([labels, metadata], dim=0)
 
-        return {
-            'image': image,
-            'labels': labels,
-            'metadata': metadata,
-            'path': self.data_frame.loc[idx, "Path"]
-        }
+        return image, labels
 
 
-def get_chexpert_dataloaders(root_dir, batch_size=32, policy='ones', 
-                            class_index=None, use_frontal=True, num_workers=4, include_test=True):
+def get_chexpert_dataloaders(root_dir, batch_size=32, policy='ones', class_index=None,
+                             use_frontal=True, num_workers=4, use_metadata=True):
     """
     Create CheXpert dataloaders for training, validation and test using predefined splits
     
@@ -172,7 +173,8 @@ def get_chexpert_dataloaders(root_dir, batch_size=32, policy='ones',
         transform=train_transform,
         policy=policy,
         class_index=class_index,
-        use_frontal=use_frontal
+        use_frontal=use_frontal,
+        use_metadata=use_metadata
     )
     
     val_dataset = CheXpertDataset(
@@ -181,7 +183,8 @@ def get_chexpert_dataloaders(root_dir, batch_size=32, policy='ones',
         transform=val_transform,
         policy=policy,
         class_index=class_index,
-        use_frontal=use_frontal
+        use_frontal=use_frontal,
+        use_metadata=use_metadata
     )
     
     

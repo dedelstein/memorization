@@ -204,7 +204,7 @@ def main():
     val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=64, shuffle=False, num_workers=4)
 
     # Prepare dataloaders
-    train_loader, val_loader, = get_chexpert_dataloaders(CONFIG["data_dir"])
+    train_loader, val_loader = get_chexpert_dataloaders(CONFIG["data_dir"])
 
     model = train(
         model=model,
