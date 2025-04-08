@@ -47,7 +47,7 @@ class CheXpertDataset(Dataset):
         # -------------------
         # Filter and clean df - Using preprocessing from original implementation
         
-        # Age - Grouped, in range (0-4)
+        # Age - Grouped
         self.data_frame = self.data_frame[self.data_frame["Age"] > 1]
         age_bins = [18, 44, 64, 79, np.inf]
         self.data_frame["Age"] = np.digitize(self.data_frame["Age"], bins=age_bins, right=True).astype(np.int64)

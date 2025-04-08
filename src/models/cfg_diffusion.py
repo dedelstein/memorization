@@ -27,7 +27,7 @@ class ClassifierFreeGuidedDiffusion(pl.LightningModule):
         pretrained_model_name_or_path: Optional[str] = None,
         img_size: int = 64,
         in_channels: int = 1,
-        out_channels: int = 3,
+        out_channels: int = 1,
         num_classes: int = len(CHEXPERT_CLASSES),
         center_crop_size: Optional[int] = None,
         random_flip: bool = True,
