@@ -96,11 +96,9 @@ def train_cfg_diffusion(args):
     # Set up trainer
     trainer = pl.Trainer(
         max_epochs=args.epochs,
-        accelerator="auto",
-        devices=1 if torch.cuda.is_available() else None,
-        precision="16-mixed"
-        if torch.cuda.is_available()
-        else 32,  # Use mixed precision if available
+        accelerator="auto",  # This will automatically detect the available hardware
+        devices=1 if torch.cuda.is_available() else 1,  # Use 1 device regardless of hardware type
+        precision="16-mixed" if torch.cuda.is_available() else 32,  # Use mixed precision only on GPU
         logger=logger,
         callbacks=[
             checkpoint_callback,
@@ -133,8 +131,8 @@ def main():
     # Data parameters
     parser.add_argument(
         "--data_dir",
+        default="/dtu/blackhole/1d/214141/CheXpert-v1.0-small",
         type=str,
-        required=True,
         help="Path to CheXpert-v1.0-small folder with train.csv and valid.csv",
     )
 

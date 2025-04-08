@@ -189,3 +189,7 @@ cython_debug/
 
 
 cft_classifier/optimized_model.h5
+
+
+*.out
+*.err
