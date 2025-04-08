@@ -97,8 +97,12 @@ def main():
     parser = argparse.ArgumentParser(description="Train a classifier on CheXpert")
     
     # Data parameters
-    parser.add_argument('--data_dir', type=str, required=True,
-                        help='Path to CheXpert-v1.0-small folder with train.csv and valid.csv')
+    parser.add_argument(
+        "--data_dir",
+        default="/dtu/blackhole/1d/214141/CheXpert-v1.0-small",
+        type=str,
+        help="Path to CheXpert-v1.0-small folder with train.csv and valid.csv",
+    )
     
     # Model parameters
     parser.add_argument('--img_size', type=int, default=64, help='Image size')

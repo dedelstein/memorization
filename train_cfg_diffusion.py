@@ -115,7 +115,7 @@ def train_cfg_diffusion(args):
 
     # Save final model
     trainer.save_checkpoint(
-        os.path.join("checkpoints", "cfg_diffusion", "cfg_diffusion_final.ckpt")
+            os.path.join("checkpoints", "cfg_diffusion", "cfg_diffusion_final.ckpt")
     )
 
     print(f"Best model path: {checkpoint_callback.best_model_path}")
