@@ -8,7 +8,7 @@ import argparse
 import torch
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, EarlyStopping
-from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.loggers import NeptuneLogger
 
 from src.data.chexpert_datamodule import CheXpertDataModule
 from src.models.classifier import ClassifierModule
@@ -49,10 +49,12 @@ def train_classifier(args):
         time_dim=args.time_dim
     )
     
-    # Set up logging
-    logger = TensorBoardLogger(
-        save_dir=os.path.join('logs', 'classifier'),
-        name=f'img_size={args.img_size}'
+    # Set up logging with Neptune instead of TensorBoard
+    logger = NeptuneLogger(
+        project=os.environ.get("NEPTUNE_PROJECT"),
+        api_key=os.environ.get("NEPTUNE_API_KEY"),
+        log_model_checkpoints=os.environ.get("NEPTUNE_LOG_MODEL_CHECKPOINTS", "False").lower() == "true",
+        tags=[f"img_size={args.img_size}"]
     )
     
     # Set up callbacks

@@ -72,7 +72,7 @@ class CheXpertDataset(Dataset):
         # Use a small subset for debugging if requested
         if debug_mode:
             logger.info("Debug mode enabled - using only 5000 samples")
-            self.data_frame = self.data_frame.iloc[:5000]
+            self.data_frame = self.data_frame.iloc[:100]
         
         # Store directory and transform
         self.base_dir = base_dir

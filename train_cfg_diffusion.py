@@ -13,7 +13,7 @@ from pytorch_lightning.callbacks import (
     LearningRateMonitor,
     ModelCheckpoint,
 )
-from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.loggers import NeptuneLogger
 
 from src.data.chexpert_datamodule import CheXpertDataModule
 from src.models.cfg_diffusion import ClassifierFreeGuidedDiffusion
@@ -21,6 +21,9 @@ from src.utils.constants import CHEXPERT_CLASSES
 from src.utils.progress_visualization_callback import (
     ProgressVisualizationCallback
 )
+# Load .env file
+from dotenv import load_dotenv
+load_dotenv()
 
 
 def train_cfg_diffusion(args):
@@ -66,16 +69,19 @@ def train_cfg_diffusion(args):
         use_ema=True
     )
 
-    # Set up logging
-    logger = TensorBoardLogger(
-        save_dir=os.path.join("logs", "cfg_diffusion"), name=f"image_size_{args.img_size}"
+    # Set up logging with Neptune instead of TensorBoard
+    logger = NeptuneLogger(
+        project=os.environ.get("NEPTUNE_PROJECT"),
+        api_key=os.environ.get("NEPTUNE_API_KEY"),
+        log_model_checkpoints=os.environ.get("NEPTUNE_LOG_MODEL_CHECKPOINTS", "False").lower() == "true",
+        tags=[f"image_size_{args.img_size}", "cfg_diffusion"]
     )
 
     # Set up callbacks
     checkpoint_callback = ModelCheckpoint(
         dirpath=os.path.join("checkpoints", "cfg_diffusion"),
         filename="cfg_diffusion-{epoch:02d}-{val_loss:.4f}",
-        save_top_k=3,
+        save_top_k=1,
         monitor="val_loss",
         mode="min",
     )

@@ -7,6 +7,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 from pytorch_lightning.callbacks import Callback
 from datetime import datetime
+from neptune.types import File
+from pytorch_lightning.loggers import NeptuneLogger
 
 from src.utils.constants import CHEXPERT_CLASSES
 
@@ -178,7 +180,8 @@ class ProgressVisualizationCallback(Callback):
                     plt.axis('off')
                     plt.title(f"{cond_name} - Epoch {epoch+1}")
                     plt.tight_layout()
-                    plt.savefig(os.path.join(cond_dir, f"sample_{j+1:02d}.png"), dpi=150)
+                    sample_path = os.path.join(cond_dir, f"sample_{j+1:02d}.png")
+                    plt.savefig(sample_path, dpi=150)
                     plt.close()
                 
                 # Add samples to the final grid
@@ -186,26 +189,35 @@ class ProgressVisualizationCallback(Callback):
                 all_conditions.extend([cond_name] * self.num_samples)
             
             # Create a grid with all samples
-            self._create_grid(all_samples, all_conditions, epoch+1, epoch_dir)
+            grid_path = self._create_grid(all_samples, all_conditions, epoch+1, epoch_dir)
             
             # Save temporal evolution if there's more than one epoch
             if epoch > 0:
-                self._create_timeline(trainer, pl_module)
+                timeline_paths = self._create_timeline(trainer, pl_module)
             
-            # Send to TensorBoard if available
-            if trainer.logger:
+            # Send to Neptune if available
+            if trainer.logger and isinstance(trainer.logger, NeptuneLogger):
                 try:
+                    # Log the grid image - using unique path instead of appending
+                    trainer.logger.experiment[f"images/grid/epoch_{epoch+1}"].upload(
+                        File(grid_path)
+                    )
+                    
+                    # Log individual condition images - use unique path structure to avoid conflicts
                     for i, cond_idx in enumerate(self.condition_indices):
                         cond_name = self.conditions[i]
-                        # Normalize to [0, 1] for TensorBoard
-                        tb_samples = torch.stack([img.float() / 255.0 for img in all_samples[i]])
-                        trainer.logger.experiment.add_images(
-                            f"progress/{cond_name}", 
-                            tb_samples,
-                            global_step=epoch+1
-                        )
+                        cond_name_slug = cond_name.replace(" ", "_")
+                        sample_path = os.path.join(epoch_dir, cond_name_slug, "sample_01.png")
+                        
+                        # Only log the first sample for each condition to avoid clutter
+                        if os.path.exists(sample_path):
+                            # Create unique field for each condition+epoch combination
+                            # Instead of appending to same series with same step value
+                            trainer.logger.experiment[f"images/epoch_{epoch+1}/{cond_name_slug}"].upload(
+                                File(sample_path)
+                            )
                 except Exception as e:
-                    print(f"Error sending images to TensorBoard: {e}")
+                    print(f"Error sending images to Neptune: {e}")
             
             print(f"Progress images saved to: {epoch_dir}\n")
             
@@ -237,8 +249,11 @@ class ProgressVisualizationCallback(Callback):
         
         plt.tight_layout()
         plt.subplots_adjust(top=0.95)  # Adjust space for title
-        plt.savefig(os.path.join(save_dir, f"grid_epoch_{epoch:03d}.png"), dpi=200)
+        grid_path = os.path.join(save_dir, f"grid_epoch_{epoch:03d}.png")
+        plt.savefig(grid_path, dpi=200)
         plt.close()
+        
+        return grid_path
     
     def _create_timeline(self, trainer, pl_module):
         """
@@ -256,11 +271,14 @@ class ProgressVisualizationCallback(Callback):
                     epoch_dirs.append(epoch_dir)
         
         if len(available_epochs) <= 1:
-            return  # Not enough epochs to show evolution
+            return []  # Not enough epochs to show evolution
         
         # Create directory for temporal evolution
         timeline_dir = os.path.join(self.output_dir, "timeline")
         os.makedirs(timeline_dir, exist_ok=True)
+        
+        # Store paths of all timeline images for logging to Neptune
+        timeline_paths = []
         
         # For each condition, create a visualization of the evolution
         for i, cond_name in enumerate(self.conditions):
@@ -283,8 +301,10 @@ class ProgressVisualizationCallback(Callback):
                         ax.axis('off')
             
             plt.tight_layout()
-            plt.savefig(os.path.join(timeline_dir, f"evolution_{cond_name.replace(' ', '_')}.png"), dpi=200)
+            timeline_path = os.path.join(timeline_dir, f"evolution_{cond_name.replace(' ', '_')}.png")
+            plt.savefig(timeline_path, dpi=200)
             plt.close()
+            timeline_paths.append(timeline_path)
         
         # Create a gif for each condition if possible
         try:
@@ -300,17 +320,29 @@ class ProgressVisualizationCallback(Callback):
                 
                 if images:
                     # Save the gif with a duration of 1 second per image and infinite loop
+                    gif_path = os.path.join(timeline_dir, f"evolution_{cond_name.replace(' ', '_')}.gif")
                     images[0].save(
-                        os.path.join(timeline_dir, f"evolution_{cond_name.replace(' ', '_')}.gif"),
+                        gif_path,
                         save_all=True,
                         append_images=images[1:],
                         duration=1000,
                         loop=0
                     )
+                    timeline_paths.append(gif_path)
+                    
+                    # Log the GIF to Neptune if logger exists
+                    if trainer.logger and isinstance(trainer.logger, NeptuneLogger):
+                        try:
+                            trainer.logger.experiment[f"images/evolution/{cond_name.replace(' ', '_')}"].upload(
+                                File(gif_path)
+                            )
+                        except Exception as e:
+                            print(f"Error uploading GIF to Neptune: {e}")
         except Exception as e:
             print(f"Could not create evolution GIFs: {e}")
             
         print(f"Temporal evolution visualizations saved to: {timeline_dir}")
+        return timeline_paths
 
     def on_validation_epoch_end(self, trainer, pl_module):
         """
@@ -370,7 +402,8 @@ class ProgressVisualizationCallback(Callback):
                     plt.axis('off')
                     plt.title(f"{cond_name} - Val Epoch {epoch+1}")
                     plt.tight_layout()
-                    plt.savefig(os.path.join(cond_dir, f"val_sample_{j+1:02d}.png"), dpi=150)
+                    sample_path = os.path.join(cond_dir, f"val_sample_{j+1:02d}.png")
+                    plt.savefig(sample_path, dpi=150)
                     plt.close()
                 
                 # Add samples to the final grid
@@ -378,22 +411,29 @@ class ProgressVisualizationCallback(Callback):
                 all_conditions.extend([cond_name] * self.num_samples)
             
             # Create a grid with all samples
-            self._create_validation_grid(all_samples, all_conditions, epoch+1, val_dir)
+            grid_path = self._create_validation_grid(all_samples, all_conditions, epoch+1, val_dir)
             
-            # Send to TensorBoard if available
-            if trainer.logger:
+            # Log to Neptune if available
+            if trainer.logger and isinstance(trainer.logger, NeptuneLogger):
                 try:
+                    # Log the validation grid - using unique paths instead of appending
+                    trainer.logger.experiment[f"images/validation/grid/epoch_{epoch+1}"].upload(
+                        File(grid_path)
+                    )
+                    
+                    # Log individual condition images
                     for i, cond_idx in enumerate(self.condition_indices):
                         cond_name = self.conditions[i]
-                        # Normalize to [0, 1] for TensorBoard
-                        tb_samples = torch.stack([img.float() / 255.0 for img in all_samples[i]])
-                        trainer.logger.experiment.add_images(
-                            f"validation/{cond_name}", 
-                            tb_samples,
-                            global_step=epoch+1
-                        )
+                        cond_name_slug = cond_name.replace(" ", "_")
+                        sample_path = os.path.join(val_dir, cond_name_slug, f"val_sample_01.png")
+                        
+                        # Only log the first sample for each condition
+                        if os.path.exists(sample_path):
+                            trainer.logger.experiment[f"images/validation/epoch_{epoch+1}/{cond_name_slug}"].upload(
+                                File(sample_path)
+                            )
                 except Exception as e:
-                    print(f"Error sending validation images to TensorBoard: {e}")
+                    print(f"Error sending validation images to Neptune: {e}")
             
             print(f"Validation images saved to: {val_dir}\n")
             
@@ -424,5 +464,8 @@ class ProgressVisualizationCallback(Callback):
         
         plt.tight_layout()
         plt.subplots_adjust(top=0.95)  # Adjust space for title
-        plt.savefig(os.path.join(save_dir, f"val_grid_epoch_{epoch:03d}.png"), dpi=200)
+        grid_path = os.path.join(save_dir, f"val_grid_epoch_{epoch:03d}.png")
+        plt.savefig(grid_path, dpi=200)
         plt.close()
+        
+        return grid_path

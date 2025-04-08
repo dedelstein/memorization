@@ -13,3 +13,4 @@ kagglehub
 pillow
 pandas
 torch-ema
+neptune

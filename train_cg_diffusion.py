@@ -8,7 +8,7 @@ import argparse
 import torch
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, EarlyStopping
-from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.loggers import NeptuneLogger
 
 from src.data.chexpert_datamodule import CheXpertDataModule
 from src.models.cfg_diffusion import ClassifierFreeGuidedDiffusion
@@ -54,10 +54,12 @@ def train_cfg_diffusion(args):
         use_ema=True
     )
     
-    # Set up logging
-    logger = TensorBoardLogger(
-        save_dir=os.path.join('logs', 'cfg_diffusion'),
-        name=f'img_size={args.img_size}'
+    # Set up logging with Neptune instead of TensorBoard
+    logger = NeptuneLogger(
+        project=os.environ.get("NEPTUNE_PROJECT"),
+        api_key=os.environ.get("NEPTUNE_API_KEY"),
+        log_model_checkpoints=os.environ.get("NEPTUNE_LOG_MODEL_CHECKPOINTS", "False").lower() == "true",
+        tags=[f"img_size={args.img_size}", "cfg_diffusion"]
     )
     
     # Set up callbacks
@@ -112,18 +114,16 @@ def train_cfg_diffusion(args):
                 normal_grid = torch.stack([img.float() / 255.0 for img in normal_samples])
                 pneumonia_grid = torch.stack([img.float() / 255.0 for img in pneumonia_samples])
                 
-                # Log to tensorboard
+                # Log to Neptune
                 if trainer.logger:
-                    trainer.logger.experiment.add_images(
-                        "samples/normal", 
-                        normal_grid,
-                        trainer.global_step
-                    )
-                    trainer.logger.experiment.add_images(
-                        "samples/pneumonia", 
-                        pneumonia_grid,
-                        trainer.global_step
-                    )
+                    # Neptune requires a different logging approach than TensorBoard
+                    for i in range(len(normal_samples)):
+                        trainer.logger.experiment[f"samples/normal/{trainer.current_epoch}/sample_{i}"].upload(
+                            normal_grid[i].permute(1, 2, 0).cpu().numpy()
+                        )
+                        trainer.logger.experiment[f"samples/pneumonia/{trainer.current_epoch}/sample_{i}"].upload(
+                            pneumonia_grid[i].permute(1, 2, 0).cpu().numpy()
+                        )
     
     # Set up trainer
     trainer = pl.Trainer(
