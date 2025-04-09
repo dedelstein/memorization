@@ -57,7 +57,9 @@ def train_cfg_diffusion(args):
         lr_warmup_steps=args.warmup_steps,
         noise_scheduler_beta_schedule=args.beta_schedule,
         noise_scheduler_num_train_timesteps=args.timesteps,
-        use_ema=True,
+        use_ema=args.use_ema,
+        ema_decay=args.ema_decay,
+        ema_update_every=10,  # Valor predeterminado adecuado
     )
 
     # Set up logging with Neptune instead of TensorBoard
@@ -82,11 +84,11 @@ def train_cfg_diffusion(args):
 
     lr_monitor = LearningRateMonitor(logging_interval="step")
 
-    early_stop_callback = EarlyStopping(monitor="val_loss", patience=10, mode="min")
+    early_stop_callback = EarlyStopping(monitor="val_loss", patience=args.patience, mode="min")
 
     # Sample generation callback - custom implementation to periodically generate and log samples
     class SampleCallback(pl.Callback):
-        def __init__(self, every_n_epochs=5, num_samples=4):
+        def __init__(self, every_n_epochs=args.vis_every_n_epochs, num_samples=args.vis_num_samples):
             super().__init__()
             self.every_n_epochs = every_n_epochs
             self.num_samples = num_samples
@@ -108,15 +110,15 @@ def train_cfg_diffusion(args):
                 normal_samples = pl_module.generate_samples(
                     batch_size=self.num_samples,
                     labels=normal_label,
-                    guidance_scale=3.0,
-                    num_inference_steps=50,
+                    guidance_scale=args.guidance_scale,
+                    num_inference_steps=args.inference_steps,
                 )
 
                 pneumonia_samples = pl_module.generate_samples(
                     batch_size=self.num_samples,
                     labels=pneumonia_label,
-                    guidance_scale=3.0,
-                    num_inference_steps=50,
+                    guidance_scale=args.guidance_scale,
+                    num_inference_steps=args.inference_steps,
                 )
 
                 # Convert to numpy and normalize to [0, 1]
@@ -151,10 +153,11 @@ def train_cfg_diffusion(args):
             checkpoint_callback,
             lr_monitor,
             early_stop_callback,
-            SampleCallback(every_n_epochs=5),
+            SampleCallback(every_n_epochs=args.vis_every_n_epochs),
         ],
         log_every_n_steps=10,
         gradient_clip_val=1.0,
+        accumulate_grad_batches=args.accumulate_grad_batches,  # Acumulación de gradiente para simular lotes más grandes
     )
 
     # Train model
@@ -225,6 +228,35 @@ def main():
         type=float,
         default=0.1,
         help="Probability of dropping class conditioning (for CFG training)",
+    )
+    
+    # EMA parameters
+    parser.add_argument("--use_ema", type=bool, default=True, help="Whether to use EMA")
+    parser.add_argument(
+        "--ema_decay", type=float, default=0.9999, help="EMA decay rate"
+    )
+    
+    # Early stopping
+    parser.add_argument(
+        "--patience", type=int, default=10, help="Early stopping patience"
+    )
+    
+    # Visualization parameters
+    parser.add_argument('--vis_every_n_epochs', type=int, default=5, 
+                        help='Generate progress images every N epochs')
+    parser.add_argument('--vis_num_samples', type=int, default=4, 
+                        help='Number of samples to generate per condition')
+    parser.add_argument('--inference_steps', type=int, default=20, 
+                        help='Inference steps for generating samples')
+    parser.add_argument('--guidance_scale', type=float, default=3.0, 
+                        help='Guidance strength for generation')
+
+    # Gradient accumulation
+    parser.add_argument(
+        "--accumulate_grad_batches",
+        type=int,
+        default=1,
+        help="Number of batches to accumulate gradients for",
     )
 
     args = parser.parse_args()

@@ -114,14 +114,22 @@ class ClassifierFreeGuidedDiffusion(pl.LightningModule):
         This is the perfect place to initialize the EMA model since we know the device.
         """
         if self.use_ema:
-            # Inicializar EMA usando pytorch_ema, que es más robusto
+            # Create a clone of the UNet model before applying EMA
+            # We need to create the clone before getting parameters to avoid issues with compiled models
+            self.ema_unet = UNet2DConditionModel(**self.unet.config)
+            
+            # First copy the weights directly (safer than load_state_dict with compiled models)
+            with torch.no_grad():
+                for param_ema, param_model in zip(self.ema_unet.parameters(), self.unet.parameters()):
+                    param_ema.data.copy_(param_model.data)
+            
+            # Move the EMA model to the correct device
+            self.ema_unet.to(self.device)
+            
+            # Initialize EMA using pytorch_ema
             self.ema = ExponentialMovingAverage(
                 self.unet.parameters(), decay=self.ema_decay
             )
-            # Crear una copia del modelo para poder hacer evaluaciones con EMA
-            self.ema_unet = UNet2DConditionModel(**self.unet.config)
-            self.ema_unet.load_state_dict(self.unet.state_dict())
-            self.ema_unet.to(self.device)
 
             print(
                 f"EMA initialized on device: {self.device} with decay: {self.ema_decay}"

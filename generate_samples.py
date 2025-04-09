@@ -203,7 +203,7 @@ def main():
         help="Guidance scale (higher = stronger conditioning)",
     )
     parser.add_argument(
-        "--inference_steps", type=int, default=50, help="Number of inference steps"
+        "--inference_steps", type=int, default=20, help="Number of inference steps"
     )
 
     # Condition parameters

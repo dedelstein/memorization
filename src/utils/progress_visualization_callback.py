@@ -28,7 +28,7 @@ class ProgressVisualizationCallback(Callback):
         conditions=None,
         output_dir="progress_samples",
         guidance_scale=3.0,
-        inference_steps=30,
+        inference_steps=20,
         fixed_noise=True,
         save_on_validation=True,  # New parameter to control validation image saving
     ):

@@ -99,12 +99,13 @@ class ClassifierGuidedDiffusion(pl.LightningModule):
         # EMA model
         self.use_ema = use_ema
         if use_ema:
-            self.ema_model = EMAModel(
-                model=self.unet,
-                inv_gamma=ema_inv_gamma,
-                power=ema_power,
-                max_decay=ema_max_decay,
-            )
+            # Inicializamos el modelo EMA durante el entrenamiento
+            self.ema_model_instance = None  # Se inicializará en on_fit_start
+            self.ema_inv_gamma = ema_inv_gamma
+            self.ema_power = ema_power
+            self.ema_max_decay = ema_max_decay
+        else:
+            self.ema_model = None
 
         # Classifier
         self.classifier = None
@@ -223,11 +224,26 @@ class ClassifierGuidedDiffusion(pl.LightningModule):
 
         return loss
 
+    def on_fit_start(self):
+        """
+        Called at the beginning of training after model has been moved to the correct device.
+        This is the perfect place to properly initialize the EMA model with compiled UNet.
+        """
+        if self.use_ema and self.ema_model_instance is None:
+            # Create a new EMA model instance now that the model is on the correct device
+            self.ema_model = EMAModel(
+                model=self.unet,
+                inv_gamma=self.ema_inv_gamma,
+                power=self.ema_power,
+                max_decay=self.ema_max_decay,
+            )
+            print(f"EMA model initialized on device: {self.device}")
+            
     def on_train_batch_end(self, *args, **kwargs):
         """
         Update EMA model after each training batch.
         """
-        if self.use_ema:
+        if self.use_ema and hasattr(self, 'ema_model'):
             self.ema_model.step(self.unet.parameters())
 
     def configure_optimizers(self):

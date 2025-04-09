@@ -68,7 +68,9 @@ def train_cfg_diffusion(args):
         lr_warmup_steps=args.warmup_steps,
         noise_scheduler_beta_schedule=args.beta_schedule,
         noise_scheduler_num_train_timesteps=args.timesteps,
-        use_ema=True
+        use_ema=args.use_ema,
+        ema_decay=args.ema_decay,
+        ema_update_every=args.ema_update_every
     )
 
     # Set up logging with Neptune
@@ -110,8 +112,8 @@ def train_cfg_diffusion(args):
     trainer = pl.Trainer(
         max_epochs=args.epochs,
         accelerator="auto",  # This will automatically detect the available hardware
-        devices=1 if torch.cuda.is_available() else 1,  # Use 1 device regardless of hardware type
-        precision="16-mixed" if torch.cuda.is_available() else 32,  # Use mixed precision only on GPU
+        devices=1,
+        precision="bf16-mixed",
         logger=logger,
         callbacks=[
             checkpoint_callback,
@@ -121,6 +123,7 @@ def train_cfg_diffusion(args):
         ],
         log_every_n_steps=20,  # Reduced logging frequency
         gradient_clip_val=1.0,
+        accumulate_grad_batches=args.accumulate_grad_batches,  # Acumulación de gradiente para simular lotes más grandes
     )
 
     # Train model
@@ -150,7 +153,7 @@ def main():
     )
 
     # Model parameters
-    parser.add_argument("--img_size", type=int, default=((56)*2), help="Image size")
+    parser.add_argument("--img_size", type=int, default=64, help="Image size")
     parser.add_argument(
         "--pretrained_model_path",
         type=str,
@@ -201,16 +204,27 @@ def main():
     parser.add_argument(
         "--ema_update_every", type=int, default=10, help="Update EMA every N steps"
     )
-
+    
+    # Early stopping
+    parser.add_argument(
+        "--patience", type=int, default=15, help="Early stopping patience"
+    )
+    
      # Visualization parameters
     parser.add_argument('--vis_every_n_epochs', type=int, default=5, 
                         help='Generate progress images every N epochs')
     parser.add_argument('--vis_num_samples', type=int, default=4, 
                         help='Number of samples to generate per condition')
-    parser.add_argument('--inference_steps', type=int, default=30, 
+    parser.add_argument('--inference_steps', type=int, default=20, 
                         help='Inference steps for generating samples')
     parser.add_argument('--guidance_scale', type=float, default=3.0, 
                         help='Guidance strength for generation')
+    
+    # Gradient accumulation
+    parser.add_argument(
+        "--accumulate_grad_batches", type=int, default=1, 
+        help="Number of batches to accumulate gradients for"
+    )
     
     args = parser.parse_args()
 
