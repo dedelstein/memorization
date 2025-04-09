@@ -11,6 +11,7 @@ from torchvision import transforms
 import pytorch_lightning as pl
 from PIL import Image
 import logging
+import pyarrow.parquet as pq  # Add import for Parquet handling
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -21,7 +22,7 @@ class CheXpertDataset(Dataset):
     Incorporates preprocessing from original implementation.
     """
     def __init__(self, 
-                 csv_file,
+                 parquet_file,
                  base_dir,
                  transform=None,
                  use_frontal_only=True,
@@ -31,7 +32,7 @@ class CheXpertDataset(Dataset):
                  use_metadata=True):
         """
         Args:
-            csv_file: Path to the csv file with annotations.
+            parquet_file: Path to the Parquet file with annotations.
             base_dir: Base directory containing train/valid folders.
             transform: Optional transform to be applied on a sample.
             use_frontal_only: If True, only use frontal views.
@@ -40,45 +41,12 @@ class CheXpertDataset(Dataset):
             class_index: Which classes to use (defaults to all 14).
             use_metadata: Whether to include metadata in the labels.
         """
-        # Read the CSV file
-        self.data_frame = pd.read_csv(csv_file)
-        self.use_metadata = use_metadata
-        
-        # -------------------
-        # Filter and clean df - Using preprocessing from original implementation
-        
-        # Age - Grouped
-        self.data_frame = self.data_frame[self.data_frame["Age"] > 1]
-        age_bins = [18, 44, 64, 79, np.inf]
-        self.data_frame["Age"] = np.digitize(self.data_frame["Age"], bins=age_bins, right=True).astype(np.int64)
-
-        # Sex (0 - Female, 1 - Male)
-        self.data_frame["Sex"] = self.data_frame["Sex"].apply(lambda x: 1 if x == "Male" else 0)
-
-        # Frontal, AP/PA - AP/PA in (0 - None, 1 - AP, 2 - PA)
-        self.data_frame["AP/PA"] = self.data_frame["AP/PA"].apply(lambda x: 1 if x == "AP" else 2 if x == "PA" else 0)
-        self.data_frame["Frontal/Lateral"] = self.data_frame["Frontal/Lateral"].apply(lambda x: 1 if x == "Frontal" else 0)
-
-        # Apply frontal filtering if requested
-        if use_frontal_only:
-            logger.info("Filtering for frontal views only")
-            self.data_frame = self.data_frame[self.data_frame["Frontal/Lateral"] == 1]
-
-        # Replace all NaN values in findings with 0
-        self.data_frame = self.data_frame.fillna(0)
-        self.data_frame = self.data_frame.reset_index(drop=True)
-        # -------------------
-        
-        # Use a small subset for debugging if requested
-        if debug_mode:
-            logger.info("Debug mode enabled - using only 5000 samples")
-            self.data_frame = self.data_frame.iloc[:100]
-        
-        # Store directory and transform
+        self.parquet_file = parquet_file  # Store the Parquet file path
         self.base_dir = base_dir
         self.transform = transform
         self.policy = policy
-        
+        self.use_metadata = use_metadata
+
         # Define findings (labels) list
         self.findings = [
             "No Finding", "Enlarged Cardiomediastinum", "Cardiomegaly", 
@@ -87,11 +55,18 @@ class CheXpertDataset(Dataset):
             "Pleural Other", "Fracture", "Support Devices"
         ]
         
-        # Define metadata fields
-        self.metadata = [
-            "Sex", "Age", "Frontal/Lateral", "AP/PA"
-        ]
-        
+        # Define metadata fields (only if use_metadata is True)
+        self.metadata = ["Sex", "Age", "Frontal/Lateral", "AP/PA"] if use_metadata else []
+
+        # Load the entire Parquet file into memory as a Pandas DataFrame
+        self.data_frame = pd.read_parquet(parquet_file)  # Load all columns
+        self.num_samples = len(self.data_frame)
+
+        # Filter for frontal views if requested
+        if use_frontal_only:
+            self.data_frame = self.data_frame[self.data_frame["Frontal/Lateral"] == 1]
+            self.num_samples = len(self.data_frame)
+
         # Allow filtering for specific classes
         if class_index is None:
             self.class_index = list(range(len(self.findings)))
@@ -99,65 +74,43 @@ class CheXpertDataset(Dataset):
             self.class_index = class_index
             
         self.classes = [self.findings[i] for i in self.class_index]
-        
-        # Apply the policy for uncertain labels
-        self._apply_policy()
-    
-    def _apply_policy(self):
-        """Apply the selected policy for uncertain labels (-1)"""
-        if self.policy == 'ones':
-            self.data_frame.loc[:, self.classes] = self.data_frame.loc[:, self.classes].replace(-1, 1)
-        elif self.policy == 'zeros':
-            self.data_frame.loc[:, self.classes] = self.data_frame.loc[:, self.classes].replace(-1, 0)
-        elif self.policy == 'ignore':
-            pass
-        else:
-            raise ValueError(f"Unknown policy: {self.policy}")
-    
+
+        # Debug mode: Use a small subset of data
+        if debug_mode:
+            logger.info("Debug mode enabled - using only 100 samples")
+            self.data_frame = self.data_frame.iloc[:100]
+            self.num_samples = len(self.data_frame)
+
     def __len__(self):
-        return len(self.data_frame)
+        return self.num_samples
     
     def __getitem__(self, idx):
         if torch.is_tensor(idx):
             idx = idx.tolist()
         
-        # Get the image path from the Path column
-        path_in_csv = self.data_frame.iloc[idx]["Path"]
+        # Access the row directly from the preloaded DataFrame
+        row = self.data_frame.iloc[idx]
         
-        # Handle the "CheXpert-v1.0-small" prefix in the CSV
-        if path_in_csv.startswith("CheXpert-v1.0-small/"):
-            # Remove the prefix
-            path_in_csv = path_in_csv[len("CheXpert-v1.0-small/"):]
+        # Extract the image data directly from the "image" column
+        image_data = row["image"]  # Assuming the "image" column contains raw image data
         
-        # Construct the full path
-        img_path = os.path.join(self.base_dir, path_in_csv)
-        
-        # Log the path being used (only for the first few images)
-        if idx < 3:
-            logger.info(f"Loading image at path: {img_path}")
-        
-        # Load the image as grayscale (L mode) as in the first implementation
+        # Convert the image data to a PIL Image
         try:
-            image = Image.open(img_path).convert('L')
+            image = Image.fromarray(np.array(image_data, dtype=np.uint8)).convert('L')
         except Exception as e:
-            logger.error(f"Error loading image {img_path}: {e}")
-            # Create a gray image as fallback
-            image = Image.new('L', (224, 224), color=128)
+            logger.error(f"Error processing image data at index {idx}: {e}")
+            image = Image.new('L', (224, 224), color=128)  # Fallback to a blank image
         
         # Transform the image if needed
         if self.transform:
             image = self.transform(image)
         
-        # Feature only labels using the class index
-        labels = torch.tensor(
-            self.data_frame.loc[idx, self.classes].values.astype(np.float32)
-        )
-
-        # If you want Age, Sex, F/L, AP/PA
+        # Extract labels
+        labels = torch.tensor(row[self.classes].values.astype(np.float32))
+        
+        # Add metadata to labels only if use_metadata is True
         if self.use_metadata:
-            metadata = torch.tensor(
-                self.data_frame.loc[idx, self.metadata].values.astype(np.float32)
-            )
+            metadata = torch.tensor(row[self.metadata].values.astype(np.float32))
             labels = torch.cat([labels, metadata], dim=0)
         
         return image, labels
@@ -192,7 +145,7 @@ class CheXpertDataModule(pl.LightningDataModule):
         self.pin_memory = pin_memory
         self.policy = policy
         self.class_index = class_index
-        self.use_metadata = False # use_metadata
+        self.use_metadata = use_metadata
         
         # Define transforms using the normalization parameters from the first implementation
         self.train_transform = transforms.Compose([
@@ -212,34 +165,34 @@ class CheXpertDataModule(pl.LightningDataModule):
         if not os.path.exists(self.data_dir):
             raise ValueError(f"Data directory not found: {self.data_dir}")
         
-        # Check for train.csv and valid.csv
-        train_csv = os.path.join(self.data_dir, 'train.csv')
-        valid_csv = os.path.join(self.data_dir, 'valid.csv')
+        # Check for train.parquet and valid.parquet
+        train_parquet = os.path.join(self.data_dir, 'train.parquet')  # Changed to Parquet
+        valid_parquet = os.path.join(self.data_dir, 'valid.parquet')  # Changed to Parquet
         
-        if not os.path.exists(train_csv):
-            raise FileNotFoundError(f"Train CSV file not found: {train_csv}")
-        if not os.path.exists(valid_csv):
-            raise FileNotFoundError(f"Valid CSV file not found: {valid_csv}")
+        if not os.path.exists(train_parquet):
+            raise FileNotFoundError(f"Train Parquet file not found: {train_parquet}")
+        if not os.path.exists(valid_parquet):
+            raise FileNotFoundError(f"Valid Parquet file not found: {valid_parquet}")
         
         # Log the data directory
         logger.info(f"Using data directory: {self.data_dir}")
-        logger.info(f"Train CSV exists: {os.path.exists(train_csv)}")
-        logger.info(f"Valid CSV exists: {os.path.exists(valid_csv)}")
+        logger.info(f"Train Parquet exists: {os.path.exists(train_parquet)}")
+        logger.info(f"Valid Parquet exists: {os.path.exists(valid_parquet)}")
     
     def setup(self, stage=None):
         """Set up the dataset splits."""
-        # Find the CSV files
-        train_csv = os.path.join(self.data_dir, 'train.csv')
-        valid_csv = os.path.join(self.data_dir, 'valid.csv')
+        # Find the Parquet files
+        train_parquet = os.path.join(self.data_dir, 'train.parquet')  # Changed to Parquet
+        valid_parquet = os.path.join(self.data_dir, 'valid.parquet')  # Changed to Parquet
         
-        logger.info(f"Using train CSV: {train_csv}")
-        logger.info(f"Using valid CSV: {valid_csv}")
+        logger.info(f"Using train Parquet: {train_parquet}")
+        logger.info(f"Using valid Parquet: {valid_parquet}")
         
         if stage == 'fit' or stage is None:
             logger.info("Setting up training dataset...")
             # Set up training dataset with our updated CheXpertDataset class
             self.train_dataset = CheXpertDataset(
-                csv_file=train_csv,
+                parquet_file=train_parquet,  # Changed to Parquet
                 base_dir=self.data_dir,
                 transform=self.train_transform,
                 use_frontal_only=self.use_frontal_only,
@@ -252,7 +205,7 @@ class CheXpertDataModule(pl.LightningDataModule):
             logger.info("Setting up validation dataset...")
             # Set up validation dataset
             self.val_dataset = CheXpertDataset(
-                csv_file=valid_csv,
+                parquet_file=valid_parquet,  # Changed to Parquet
                 base_dir=self.data_dir,
                 transform=self.val_transform,
                 use_frontal_only=self.use_frontal_only,
@@ -282,7 +235,7 @@ class CheXpertDataModule(pl.LightningDataModule):
             if not hasattr(self, 'test_dataset'):
                 logger.info("Setting up test dataset...")
                 val_dataset = CheXpertDataset(
-                    csv_file=valid_csv,
+                    parquet_file=valid_parquet,  # Changed to Parquet
                     base_dir=self.data_dir,
                     transform=self.val_transform,
                     use_frontal_only=self.use_frontal_only,
@@ -313,7 +266,7 @@ class CheXpertDataModule(pl.LightningDataModule):
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
             drop_last=True,
-            persistent_workers=self.num_workers > 0
+            persistent_workers=True  # Enable persistent workers for efficiency
         )
     
     def val_dataloader(self):
@@ -325,7 +278,7 @@ class CheXpertDataModule(pl.LightningDataModule):
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
             drop_last=False,
-            persistent_workers=self.num_workers > 0
+            persistent_workers=True  # Enable persistent workers for efficiency
         )
     
     def test_dataloader(self):
@@ -337,22 +290,27 @@ class CheXpertDataModule(pl.LightningDataModule):
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
             drop_last=False,
-            persistent_workers=self.num_workers > 0
+            persistent_workers=True  # Enable persistent workers for efficiency
         )
-        
-# # Add this to test DataLoader efficiency
-# if __name__ == "__main__":
-#     from time import time
-#     data_module = CheXpertDataModule(data_dir="/dtu/blackhole/1d/214141/CheXpert-v1.0-small", batch_size=16, num_workers=4)
-#     data_module.prepare_data()
-#     data_module.setup(stage="fit")
+
+# Add this to test DataLoader efficiency
+if __name__ == "__main__":
+    data_dir = "/work3/s243891/CheXpert-v1.0-small"
+    from time import time
+    data_module = CheXpertDataModule(data_dir=data_dir, batch_size=16, num_workers=4)
+    data_module.prepare_data()
+    data_module.setup(stage="fit")
     
-#     train_loader = data_module.train_dataloader()
+    train_loader = data_module.train_dataloader()
     
-#     start_time = time()
-#     for i, (images, labels) in enumerate(train_loader):
-#         if i == 10:  # Test the first 10 batches
-#             break
-#     end_time = time()
+    start_time = time()
+    for i, (images, labels) in enumerate(train_loader):
+        if i == 10:  # Test the first 10 batches
+            break
+    end_time = time()
     
-#     print(f"Time to load 10 batches: {end_time - start_time:.2f} seconds")
+    print(f"Time to load 10 batches: {end_time - start_time:.2f} seconds")
+    
+    # df = pd.read_parquet("/work3/s243891/CheXpert-v1.0-small/valid.parquet")
+    # print(df.head())
+    # print(df.columns)

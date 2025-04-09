@@ -193,3 +193,5 @@ cft_classifier/optimized_model.h5
 
 *.out
 *.err
+*.neptune/
+.neptune/

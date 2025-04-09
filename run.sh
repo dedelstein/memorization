@@ -30,4 +30,6 @@ module load pandas/2.1.3-python-3.10.13
 
 source venv/bin/activate
 
-python3 train_cfg_diffusion.py > joboutput_$LSB_JOBID.out 2>&1
+python3 train_cfg_diffusion.py --batch_size 4 > joboutput_$LSB_JOBID.out 2>&1
+
+# export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True

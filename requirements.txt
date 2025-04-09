@@ -14,3 +14,4 @@ pillow
 pandas
 torch-ema
 neptune
+dotenv

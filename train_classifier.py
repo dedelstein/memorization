@@ -77,8 +77,9 @@ def train_classifier(args):
     # Set up trainer
     trainer = pl.Trainer(
         max_epochs=args.epochs,
-        accelerator='auto',
-        devices=1 if torch.cuda.is_available() else None,
+        accelerator="auto",  # This will automatically detect the available hardware
+        devices=1 if torch.cuda.is_available() else 1,  # Use 1 device regardless of hardware type
+        precision="16-mixed" if torch.cuda.is_available() else 32,  # Use mixed precision only on GPU
         logger=logger,
         callbacks=[checkpoint_callback, lr_monitor, early_stop_callback],
         log_every_n_steps=10

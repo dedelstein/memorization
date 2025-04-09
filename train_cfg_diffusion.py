@@ -58,8 +58,8 @@ def train_cfg_diffusion(args):
     model = ClassifierFreeGuidedDiffusion(
         pretrained_model_name_or_path=args.pretrained_model_path if args.pretrained_model_path else None,
         img_size=args.img_size,
-        in_channels=1,  # Changed from 3 to 1
-        out_channels=1,  # Changed from 3 to 1
+        in_channels=1,  
+        out_channels=1,  
         num_classes=len(CHEXPERT_CLASSES),
         conditioning_dropout_prob=args.dropout_prob,
         lr=args.lr,
@@ -88,7 +88,7 @@ def train_cfg_diffusion(args):
 
     lr_monitor = LearningRateMonitor(logging_interval="step")
 
-    early_stop_callback = EarlyStopping(monitor="val_loss", patience=10, mode="min")
+    early_stop_callback = EarlyStopping(monitor="val_loss", patience=2, mode="min")
 
     # Use the new visualization callback
     vis_callback = ProgressVisualizationCallback(
@@ -137,13 +137,13 @@ def main():
     # Data parameters
     parser.add_argument(
         "--data_dir",
-        default="/dtu/blackhole/1d/214141/CheXpert-v1.0-small",
+        default="/dtu/blackhole/1d/214141/CheXpert-v1.0-small",#"/work3/s243891/CheXpert-v1.0-small",
         type=str,
         help="Path to CheXpert-v1.0-small folder with train.csv and valid.csv",
     )
 
     # Model parameters
-    parser.add_argument("--img_size", type=int, default=224, help="Image size")
+    parser.add_argument("--img_size", type=int, default=((56)*2), help="Image size")
     parser.add_argument(
         "--pretrained_model_path",
         type=str,
@@ -152,7 +152,7 @@ def main():
     )
 
     # Training parameters
-    parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
+    parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
     parser.add_argument("--epochs", type=int, default=50, help="Number of epochs")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument(
