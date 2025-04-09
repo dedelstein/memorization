@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Script to train a Classifier-Free Guided Diffusion model on the CheXpert dataset.
+Optimized for faster training and improved resource utilization.
 """
 
 import argparse
@@ -8,6 +9,9 @@ import os
 
 import pytorch_lightning as pl
 import torch
+
+# Load .env file
+from dotenv import load_dotenv
 from pytorch_lightning.callbacks import (
     EarlyStopping,
     LearningRateMonitor,
@@ -18,11 +22,8 @@ from pytorch_lightning.loggers import NeptuneLogger
 from src.data.chexpert_datamodule import CheXpertDataModule
 from src.models.cfg_diffusion import ClassifierFreeGuidedDiffusion
 from src.utils.constants import CHEXPERT_CLASSES
-from src.utils.progress_visualization_callback import (
-    ProgressVisualizationCallback
-)
-# Load .env file
-from dotenv import load_dotenv
+from src.utils.progress_visualization_callback import ProgressVisualizationCallback
+
 load_dotenv()
 
 
@@ -39,7 +40,7 @@ def train_cfg_diffusion(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Configurar precisión de cálculo para tensores
+    # Configure tensor computation precision
     if torch.cuda.is_available():
         torch.set_float32_matmul_precision("high")
 
@@ -52,14 +53,15 @@ def train_cfg_diffusion(args):
         use_frontal_only=True,
         seed=args.seed,
         debug_mode=args.debug_mode,
+        pin_memory=True,  # Enable pin_memory for faster data transfer
     )
 
-    # Create diffusion model
+    # Create optimized diffusion model
     model = ClassifierFreeGuidedDiffusion(
         pretrained_model_name_or_path=args.pretrained_model_path if args.pretrained_model_path else None,
         img_size=args.img_size,
-        in_channels=1,  
-        out_channels=1,  
+        in_channels=1,
+        out_channels=1,
         num_classes=len(CHEXPERT_CLASSES),
         conditioning_dropout_prob=args.dropout_prob,
         lr=args.lr,
@@ -69,7 +71,7 @@ def train_cfg_diffusion(args):
         use_ema=True
     )
 
-    # Set up logging with Neptune instead of TensorBoard
+    # Set up logging with Neptune
     logger = NeptuneLogger(
         project=os.environ.get("NEPTUNE_PROJECT"),
         api_key=os.environ.get("NEPTUNE_API_KEY"),
@@ -81,16 +83,21 @@ def train_cfg_diffusion(args):
     checkpoint_callback = ModelCheckpoint(
         dirpath=os.path.join("checkpoints", "cfg_diffusion"),
         filename="cfg_diffusion-{epoch:02d}-{val_loss:.4f}",
-        save_top_k=1,
+        save_top_k=1,  # Only save the best model to reduce storage usage
         monitor="val_loss",
         mode="min",
     )
 
     lr_monitor = LearningRateMonitor(logging_interval="step")
 
-    early_stop_callback = EarlyStopping(monitor="val_loss", patience=2, mode="min")
+    early_stop_callback = EarlyStopping(
+        monitor="val_loss", 
+        patience=args.patience, 
+        mode="min",
+        verbose=True
+    )
 
-    # Use the new visualization callback
+    # Use visualization callback with reduced frequency
     vis_callback = ProgressVisualizationCallback(
         every_n_epochs=args.vis_every_n_epochs,
         num_samples=args.vis_num_samples,
@@ -99,7 +106,7 @@ def train_cfg_diffusion(args):
         fixed_noise=True  # Use the same initial noise to compare evolution
     )
 
-    # Set up trainer
+    # Set up trainer with optimized parameters
     trainer = pl.Trainer(
         max_epochs=args.epochs,
         accelerator="auto",  # This will automatically detect the available hardware
@@ -112,7 +119,7 @@ def train_cfg_diffusion(args):
             early_stop_callback,
             vis_callback,
         ],
-        log_every_n_steps=10,
+        log_every_n_steps=20,  # Reduced logging frequency
         gradient_clip_val=1.0,
     )
 
@@ -137,7 +144,7 @@ def main():
     # Data parameters
     parser.add_argument(
         "--data_dir",
-        default="/dtu/blackhole/1d/214141/CheXpert-v1.0-small",#"/work3/s243891/CheXpert-v1.0-small",
+        default="/dtu/blackhole/1d/214141/CheXpert-v1.0-small",
         type=str,
         help="Path to CheXpert-v1.0-small folder with train.csv and valid.csv",
     )
@@ -152,7 +159,7 @@ def main():
     )
 
     # Training parameters
-    parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
+    parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
     parser.add_argument("--epochs", type=int, default=50, help="Number of epochs")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument(
@@ -192,7 +199,7 @@ def main():
         "--ema_decay", type=float, default=0.9999, help="EMA decay rate"
     )
     parser.add_argument(
-        "--ema_update_every", type=int, default=1, help="Update EMA every N steps"
+        "--ema_update_every", type=int, default=10, help="Update EMA every N steps"
     )
 
      # Visualization parameters
@@ -210,7 +217,7 @@ def main():
     # Create necessary directories
     os.makedirs("checkpoints/cfg_diffusion", exist_ok=True)
     os.makedirs("logs/cfg_diffusion", exist_ok=True)
-    
+
     # Train classifier-free guided diffusion model
     train_cfg_diffusion(args)
 

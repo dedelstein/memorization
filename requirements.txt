@@ -6,7 +6,6 @@ numpy
 matplotlib
 tqdm
 einops
-tensorboard
 scikit-learn
 scipy
 kagglehub
@@ -15,3 +14,4 @@ pandas
 torch-ema
 neptune
 dotenv
+diffusers
