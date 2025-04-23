@@ -34,6 +34,11 @@ class ClassifierFreeGuidedDiffusion(pl.LightningModule):
         lr: float = 1e-4,
         lr_warmup_steps: int = 500,
         optimizer_type: str = "AdamW",
+        # Nuevo parámetro para el tipo de scheduler
+        lr_scheduler_type: str = "cosine_with_warmup",
+        # Parámetros adicionales para schedulers avanzados
+        min_lr: float = 1e-6,
+        lr_num_cycles: int = 1,
         noise_scheduler_beta_schedule: str = "linear",
         noise_scheduler_num_train_timesteps: int = 1000,
         use_ema: bool = True,
@@ -55,6 +60,10 @@ class ClassifierFreeGuidedDiffusion(pl.LightningModule):
             lr: Learning rate
             lr_warmup_steps: Number of warmup steps for learning rate scheduler
             optimizer_type: Type of optimizer to use
+            lr_scheduler_type: Type of learning rate scheduler (constant_with_warmup, cosine_with_warmup, 
+                               one_cycle, reduce_on_plateau)
+            min_lr: Minimum learning rate for cosine scheduler
+            lr_num_cycles: Number of cycles for cosine scheduler with restarts
             noise_scheduler_beta_schedule: Schedule for noise variance
             noise_scheduler_num_train_timesteps: Number of diffusion steps
             use_ema: Whether to use EMA model
@@ -286,7 +295,7 @@ class ClassifierFreeGuidedDiffusion(pl.LightningModule):
         loss = F.mse_loss(noise_pred, noise)
 
         # Log metrics
-        self.log("val_loss", loss, prog_bar=True)
+        self.log("val_loss", loss, prog_bar=True, sync_dist=True)  # sync_dist=True para entrenamiento multi-GPU
 
         return loss
 
@@ -310,20 +319,95 @@ class ClassifierFreeGuidedDiffusion(pl.LightningModule):
                 eps=1e-8,
             )
 
-        scheduler = get_scheduler(
-            name="constant_with_warmup",
-            optimizer=optimizer,
-            num_warmup_steps=self.hparams.lr_warmup_steps,
-            num_training_steps=self.trainer.estimated_stepping_batches,
-        )
+        # Usar diferentes tipos de scheduler según la configuración
+        total_steps = self.trainer.estimated_stepping_batches
+        scheduler_type = self.hparams.lr_scheduler_type.lower()
+        
+        if scheduler_type == "constant_with_warmup":
+            # Scheduler con tasa constante después del warmup (original)
+            scheduler = get_scheduler(
+                name="constant_with_warmup",
+                optimizer=optimizer,
+                num_warmup_steps=self.hparams.lr_warmup_steps,
+                num_training_steps=total_steps,
+            )
+            scheduler_config = {"scheduler": scheduler, "interval": "step"}
+            
+        elif scheduler_type == "cosine_with_warmup":
+            # Coseno con warmup (mejora para modelos de difusión)
+            # Using PyTorch's CosineAnnealingWarmRestarts instead of diffusers' get_scheduler
+            # First create a warmup scheduler
+            warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+                optimizer,
+                start_factor=0.001,
+                end_factor=1.0,
+                total_iters=self.hparams.lr_warmup_steps
+            )
+            
+            # Then create a cosine scheduler
+            cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                optimizer,
+                T_0=total_steps - self.hparams.lr_warmup_steps,
+                T_mult=1,
+                eta_min=self.hparams.min_lr
+            )
+            
+            # Combine them into a sequential scheduler
+            scheduler = torch.optim.lr_scheduler.SequentialLR(
+                optimizer,
+                schedulers=[warmup_scheduler, cosine_scheduler],
+                milestones=[self.hparams.lr_warmup_steps]
+            )
+            
+            scheduler_config = {"scheduler": scheduler, "interval": "step"}
+            
+        elif scheduler_type == "one_cycle":
+            # One Cycle Policy (bueno para entrenamientos rápidos)
+            scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                optimizer,
+                max_lr=self.hparams.lr,
+                total_steps=total_steps,
+                pct_start=0.3,  # 30% del tiempo para warming up
+                div_factor=25.0,  # lr_inicial = max_lr/div_factor
+                final_div_factor=10000.0,  # lr_final = lr_inicial/final_div_factor
+            )
+            scheduler_config = {"scheduler": scheduler, "interval": "step"}
+            
+        elif scheduler_type == "reduce_on_plateau":
+            # Reduce on Plateau (para cuando no estamos seguros del tiempo de entrenamiento)
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode="min",
+                factor=0.5,
+                patience=5,
+                min_lr=self.hparams.min_lr,
+                verbose=True,
+            )
+            scheduler_config = {
+                "scheduler": scheduler, 
+                "interval": "epoch", 
+                "monitor": "val_loss",
+                "frequency": 1
+            }
+        else:
+            # Default to constant_with_warmup as safe option
+            self.logger.warning(
+                f"Unknown scheduler type: {scheduler_type}. Using constant_with_warmup as default."
+            )
+            scheduler = get_scheduler(
+                name="constant_with_warmup",
+                optimizer=optimizer,
+                num_warmup_steps=self.hparams.lr_warmup_steps,
+                num_training_steps=total_steps,
+            )
+            scheduler_config = {"scheduler": scheduler, "interval": "step"}
 
         return {
             "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "interval": "step",
-            },
+            "lr_scheduler": scheduler_config,
         }
+        
+    
 
     def generate_samples(
         self,
@@ -444,3 +528,47 @@ class ClassifierFreeGuidedDiffusion(pl.LightningModule):
         # Scale to [0, 255] and convert to uint8
         images = (images * 255).type(torch.uint8)
         return images
+        
+    def on_save_checkpoint(self, checkpoint):
+        """
+        Save EMA state in the checkpoint.
+        """
+        if self.use_ema and self.ema is not None:
+            checkpoint["ema_state_dict"] = self.ema.state_dict()
+            
+            # También guardamos los pesos del modelo EMA para cargar más fácilmente
+            if self.ema_unet is not None:
+                checkpoint["ema_unet_state_dict"] = self.ema_unet.state_dict()
+
+    def on_load_checkpoint(self, checkpoint):
+        """
+        Load EMA state from the checkpoint.
+        """
+        # Inicializar EMA si estamos usándolo
+        if self.use_ema:
+            # Si no tenemos un EMA unet todavía, creamos uno
+            if self.ema_unet is None:
+                self.ema_unet = UNet2DConditionModel(**self.unet.config)
+                
+                # Si el checkpoint tiene los pesos del EMA unet, los cargamos directamente
+                if "ema_unet_state_dict" in checkpoint:
+                    self.ema_unet.load_state_dict(checkpoint["ema_unet_state_dict"])
+                else:
+                    # En caso contrario, inicializamos con los pesos actuales del modelo
+                    with torch.no_grad():
+                        for param_ema, param_model in zip(self.ema_unet.parameters(), self.unet.parameters()):
+                            param_ema.data.copy_(param_model.data)
+                
+                # Moverlo al dispositivo correcto
+                if hasattr(self, 'device'):
+                    self.ema_unet.to(self.device)
+            
+            # Inicializar el objeto EMA si no existe
+            if self.ema is None:
+                self.ema = ExponentialMovingAverage(self.unet.parameters(), decay=self.ema_decay)
+                
+            # Cargar el estado del EMA si existe en el checkpoint
+            if "ema_state_dict" in checkpoint:
+                self.ema.load_state_dict(checkpoint["ema_state_dict"])
+            else:
+                self.logger.warning("Estado EMA no encontrado en el checkpoint pero use_ema=True. Inicializando nuevo EMA.")

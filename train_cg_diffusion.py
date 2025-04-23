@@ -57,9 +57,6 @@ def train_cfg_diffusion(args):
         lr_warmup_steps=args.warmup_steps,
         noise_scheduler_beta_schedule=args.beta_schedule,
         noise_scheduler_num_train_timesteps=args.timesteps,
-        use_ema=args.use_ema,
-        ema_decay=args.ema_decay,
-        ema_update_every=10,  # Valor predeterminado adecuado
     )
 
     # Set up logging with Neptune instead of TensorBoard
@@ -228,12 +225,6 @@ def main():
         type=float,
         default=0.1,
         help="Probability of dropping class conditioning (for CFG training)",
-    )
-    
-    # EMA parameters
-    parser.add_argument("--use_ema", type=bool, default=True, help="Whether to use EMA")
-    parser.add_argument(
-        "--ema_decay", type=float, default=0.9999, help="EMA decay rate"
     )
     
     # Early stopping

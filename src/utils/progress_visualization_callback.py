@@ -57,12 +57,7 @@ class ProgressVisualizationCallback(Callback):
         # Determine conditions to use
         if conditions is None:
             # Default conditions: normal, pneumonia, cardiomegaly, pleural effusion
-            self.conditions = [
-                "No Finding",
-                "Pneumonia",
-                "Cardiomegaly",
-                "Pleural Effusion",
-            ]
+            self.conditions = CHEXPERT_CLASSES
         else:
             self.conditions = conditions
 

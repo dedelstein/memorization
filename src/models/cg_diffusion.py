@@ -11,7 +11,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers import DDIMScheduler, DDPMScheduler, UNet2DModel
 from diffusers.optimization import get_scheduler
-from diffusers.training_utils import EMAModel
 
 from src.utils.constants import CHEXPERT_CLASSES
 
@@ -34,10 +33,6 @@ class ClassifierGuidedDiffusion(pl.LightningModule):
         optimizer_type: str = "AdamW",
         noise_scheduler_beta_schedule: str = "linear",
         noise_scheduler_num_train_timesteps: int = 1000,
-        use_ema: bool = True,
-        ema_inv_gamma: float = 1.0,
-        ema_power: float = 0.75,
-        ema_max_decay: float = 0.9999,
         classifier_path: Optional[str] = None,
     ):
         """
@@ -55,10 +50,6 @@ class ClassifierGuidedDiffusion(pl.LightningModule):
             optimizer_type: Type of optimizer to use
             noise_scheduler_beta_schedule: Schedule for noise variance
             noise_scheduler_num_train_timesteps: Number of diffusion steps
-            use_ema: Whether to use EMA model
-            ema_inv_gamma: EMA inverse gamma parameter
-            ema_power: EMA power parameter
-            ema_max_decay: EMA maximum decay parameter
             classifier_path: Path to pretrained classifier for guidance
         """
         super().__init__()
@@ -95,17 +86,6 @@ class ClassifierGuidedDiffusion(pl.LightningModule):
             beta_schedule=noise_scheduler_beta_schedule,
             num_train_timesteps=noise_scheduler_num_train_timesteps,
         )
-
-        # EMA model
-        self.use_ema = use_ema
-        if use_ema:
-            # Inicializamos el modelo EMA durante el entrenamiento
-            self.ema_model_instance = None  # Se inicializará en on_fit_start
-            self.ema_inv_gamma = ema_inv_gamma
-            self.ema_power = ema_power
-            self.ema_max_decay = ema_max_decay
-        else:
-            self.ema_model = None
 
         # Classifier
         self.classifier = None
@@ -213,8 +193,7 @@ class ClassifierGuidedDiffusion(pl.LightningModule):
         noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
 
         # Predict the noise residual (unconditional)
-        model = self.ema_model.averaged_model if self.use_ema else self.unet
-        noise_pred = model(noisy_latents, timesteps).sample
+        noise_pred = self.unet(noisy_latents, timesteps).sample
 
         # Calculate loss
         loss = F.mse_loss(noise_pred, noise)
@@ -223,28 +202,6 @@ class ClassifierGuidedDiffusion(pl.LightningModule):
         self.log("val_loss", loss, prog_bar=True)
 
         return loss
-
-    def on_fit_start(self):
-        """
-        Called at the beginning of training after model has been moved to the correct device.
-        This is the perfect place to properly initialize the EMA model with compiled UNet.
-        """
-        if self.use_ema and self.ema_model_instance is None:
-            # Create a new EMA model instance now that the model is on the correct device
-            self.ema_model = EMAModel(
-                model=self.unet,
-                inv_gamma=self.ema_inv_gamma,
-                power=self.ema_power,
-                max_decay=self.ema_max_decay,
-            )
-            print(f"EMA model initialized on device: {self.device}")
-            
-    def on_train_batch_end(self, *args, **kwargs):
-        """
-        Update EMA model after each training batch.
-        """
-        if self.use_ema and hasattr(self, 'ema_model'):
-            self.ema_model.step(self.unet.parameters())
 
     def configure_optimizers(self):
         """
@@ -382,9 +339,6 @@ class ClassifierGuidedDiffusion(pl.LightningModule):
         # Store intermediate results if requested
         timestep_latents = []
 
-        # Use EMA model if available
-        model = self.ema_model.averaged_model if self.use_ema else self.unet
-
         # Generate samples using DDIM with classifier guidance
         with torch.no_grad():
             for i, t in enumerate(ddim_scheduler.timesteps):
@@ -403,7 +357,7 @@ class ClassifierGuidedDiffusion(pl.LightningModule):
                     gradient = 0
 
                 # Predict noise residual without conditioning (unconditional model)
-                noise_pred = model(latents, timestep).sample
+                noise_pred = self.unet(latents, timestep).sample
 
                 # Step function should incorporate gradient, but we'll do it manually for clarity:
                 # 1. Get the predicted x_0

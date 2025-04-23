@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
 Script to train a Classifier-Free Guided Diffusion model on the CheXpert dataset.
-Optimized for faster training and improved resource utilization.
+Updated to work with the optimized ClassifierFreeGuidedDiffusion implementation.
 """
 
 import argparse
 import os
+from datetime import datetime
 
 import pytorch_lightning as pl
 import torch
@@ -17,7 +18,7 @@ from pytorch_lightning.callbacks import (
     LearningRateMonitor,
     ModelCheckpoint,
 )
-from pytorch_lightning.loggers import NeptuneLogger
+from pytorch_lightning.loggers import NeptuneLogger, TensorBoardLogger
 
 from src.data.chexpert_datamodule import CheXpertDataModule
 from src.models.cfg_diffusion import ClassifierFreeGuidedDiffusion
@@ -42,7 +43,7 @@ def train_cfg_diffusion(args):
 
     # Configure tensor computation precision
     if torch.cuda.is_available():
-        torch.set_float32_matmul_precision("high")
+        torch.set_float32_matmul_precision("medium")
 
     # Create data module
     datamodule = CheXpertDataModule(
@@ -50,38 +51,67 @@ def train_cfg_diffusion(args):
         img_size=args.img_size,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        use_frontal_only=True,
         seed=args.seed,
         debug_mode=args.debug_mode,
-        pin_memory=True,  # Enable pin_memory for faster data transfer
+        pin_memory=True,
     )
 
-    # Create optimized diffusion model
+    # Create optimized diffusion model with new parameters
     model = ClassifierFreeGuidedDiffusion(
-        pretrained_model_name_or_path=args.pretrained_model_path if args.pretrained_model_path else None,
+        pretrained_model_name_or_path=args.pretrained_model_path
+        if args.pretrained_model_path
+        else None,
         img_size=args.img_size,
         in_channels=1,
         out_channels=1,
         num_classes=len(CHEXPERT_CLASSES),
         conditioning_dropout_prob=args.dropout_prob,
         lr=args.lr,
-        lr_warmup_steps=args.warmup_steps,
-        noise_scheduler_beta_schedule=args.beta_schedule,
-        noise_scheduler_num_train_timesteps=args.timesteps,
+        lr_warmup_steps=args.lr_warmup_steps,
+        optimizer_type=args.optimizer_type,
+        
+        # New parameters for optimized training
+        lr_scheduler_type=args.lr_scheduler_type,
+        min_lr=args.min_lr,
+        lr_num_cycles=args.lr_num_cycles,
+        
+        # EMA parameters
         use_ema=args.use_ema,
         ema_decay=args.ema_decay,
-        ema_update_every=args.ema_update_every
+        ema_update_every=args.ema_update_every,
+        
+        # Noise scheduler parameters
+        noise_scheduler_beta_schedule=args.beta_schedule,
+        noise_scheduler_num_train_timesteps=args.timesteps,
     )
 
-    # Set up logging with Neptune
-    logger = NeptuneLogger(
-        project=os.environ.get("NEPTUNE_PROJECT"),
-        api_key=os.environ.get("NEPTUNE_API_KEY"),
-        log_model_checkpoints=os.environ.get("NEPTUNE_LOG_MODEL_CHECKPOINTS", "False").lower() == "true",
-        tags=[f"image_size_{args.img_size}", "cfg_diffusion"]
+    # Set up logging
+    loggers = []
+    
+    # Neptune Logger (if credentials are available)
+    neptune_api_key = os.environ.get("NEPTUNE_API_KEY")
+    neptune_project = os.environ.get("NEPTUNE_PROJECT")
+    
+    if neptune_api_key and neptune_project:
+        neptune_logger = NeptuneLogger(
+            project=neptune_project,
+            api_key=neptune_api_key,
+            tags=[f"image_size_{args.img_size}", "cfg_diffusion", args.lr_scheduler_type],
+        )
+        loggers.append(neptune_logger)
+    
+    # TensorBoard Logger (always available)
+    tensorboard_logger = TensorBoardLogger(
+        save_dir="logs",
+        name="cfg_diffusion",
+        version=datetime.now().strftime("%Y%m%d_%H%M%S")
     )
+    loggers.append(tensorboard_logger)
 
     # Set up callbacks
+    callbacks = []
+    
+    # Custom checkpoint callback
     checkpoint_callback = ModelCheckpoint(
         dirpath=os.path.join("checkpoints", "cfg_diffusion"),
         filename="cfg_diffusion-{epoch:02d}-{val_loss:.4f}",
@@ -89,17 +119,19 @@ def train_cfg_diffusion(args):
         monitor="val_loss",
         mode="min",
     )
+    callbacks.append(checkpoint_callback)
 
+    # LR Monitor
     lr_monitor = LearningRateMonitor(logging_interval="step")
+    callbacks.append(lr_monitor)
 
+    # Early Stopping
     early_stop_callback = EarlyStopping(
-        monitor="val_loss", 
-        patience=args.patience, 
-        mode="min",
-        verbose=True
+        monitor="val_loss", patience=args.patience, mode="min", verbose=True
     )
+    callbacks.append(early_stop_callback)
 
-    # Use visualization callback with reduced frequency
+    # Progress Visualization
     vis_callback = ProgressVisualizationCallback(
         every_n_epochs=args.vis_every_n_epochs,
         num_samples=args.vis_num_samples,
@@ -107,32 +139,31 @@ def train_cfg_diffusion(args):
         inference_steps=args.inference_steps,
         fixed_noise=True  # Use the same initial noise to compare evolution
     )
+    callbacks.append(vis_callback)
+
+    # Use appropriate precision based on hardware
+    precision = "32"
+    if torch.cuda.is_available():
+        if torch.cuda.is_bf16_supported():
+            precision = "bf16-mixed"
+        else:
+            precision = "16-mixed"
 
     # Set up trainer with optimized parameters
     trainer = pl.Trainer(
         max_epochs=args.epochs,
         accelerator="auto",  # This will automatically detect the available hardware
         devices=1,
-        precision="bf16-mixed",
-        logger=logger,
-        callbacks=[
-            checkpoint_callback,
-            lr_monitor,
-            early_stop_callback,
-            vis_callback,
-        ],
-        log_every_n_steps=20,  # Reduced logging frequency
+        precision=precision,
+        logger=loggers,
+        callbacks=callbacks,
+        log_every_n_steps=50,
         gradient_clip_val=1.0,
-        accumulate_grad_batches=args.accumulate_grad_batches,  # Acumulación de gradiente para simular lotes más grandes
+        accumulate_grad_batches=args.accumulate_grad_batches,
     )
 
     # Train model
     trainer.fit(model, datamodule=datamodule)
-
-    # Save final model
-    trainer.save_checkpoint(
-            os.path.join("checkpoints", "cfg_diffusion", "cfg_diffusion_final.ckpt")
-    )
 
     print(f"Best model path: {checkpoint_callback.best_model_path}")
     return checkpoint_callback.best_model_path
@@ -153,7 +184,7 @@ def main():
     )
 
     # Model parameters
-    parser.add_argument("--img_size", type=int, default=64, help="Image size")
+    parser.add_argument("--img_size", type=int, default=192, help="Image size")
     parser.add_argument(
         "--pretrained_model_path",
         type=str,
@@ -162,11 +193,63 @@ def main():
     )
 
     # Training parameters
-    parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
+    parser.add_argument("--batch_size", type=int, default=2, help="Batch size")
     parser.add_argument("--epochs", type=int, default=50, help="Number of epochs")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument(
-        "--warmup_steps", type=int, default=500, help="Learning rate warmup steps"
+        "--lr_warmup_steps", 
+        type=int, 
+        default=500, 
+        help="Number of warmup steps for learning rate scheduler"
+    )
+    
+    # New scheduler parameters
+    parser.add_argument(
+        "--lr_scheduler_type",
+        type=str,
+        default="cosine_with_warmup",
+        choices=["constant_with_warmup", "cosine_with_warmup", "one_cycle", "reduce_on_plateau"],
+        help="Type of learning rate scheduler to use",
+    )
+    parser.add_argument(
+        "--min_lr",
+        type=float,
+        default=1e-6,
+        help="Minimum learning rate for schedulers that support it",
+    )
+    parser.add_argument(
+        "--lr_num_cycles",
+        type=int,
+        default=1,
+        help="Number of cycles for cosine scheduler with restarts",
+    )
+    
+    # EMA parameters
+    parser.add_argument(
+        "--use_ema",
+        action="store_true",
+        default=True,
+        help="Use Exponential Moving Average for model parameters",
+    )
+    parser.add_argument(
+        "--ema_decay",
+        type=float,
+        default=0.9999,
+        help="EMA decay rate (higher = slower updating)",
+    )
+    parser.add_argument(
+        "--ema_update_every",
+        type=int,
+        default=1,
+        help="Update EMA every N steps",
+    )
+    
+    parser.add_argument(
+        "--optimizer_type",
+        type=str,
+        default="adamW",
+        choices=["adam", "adamw"],
+        help="Optimizer type to use",
     )
     parser.add_argument(
         "--num_workers", type=int, default=4, help="Number of data loader workers"
@@ -196,41 +279,53 @@ def main():
         help="Probability of dropping class conditioning (for CFG training)",
     )
 
-    # EMA parameters
-    parser.add_argument("--use_ema", type=bool, default=True, help="Whether to use EMA")
-    parser.add_argument(
-        "--ema_decay", type=float, default=0.9999, help="EMA decay rate"
-    )
-    parser.add_argument(
-        "--ema_update_every", type=int, default=10, help="Update EMA every N steps"
-    )
-    
     # Early stopping
     parser.add_argument(
         "--patience", type=int, default=15, help="Early stopping patience"
     )
-    
-     # Visualization parameters
-    parser.add_argument('--vis_every_n_epochs', type=int, default=5, 
-                        help='Generate progress images every N epochs')
-    parser.add_argument('--vis_num_samples', type=int, default=4, 
-                        help='Number of samples to generate per condition')
-    parser.add_argument('--inference_steps', type=int, default=20, 
-                        help='Inference steps for generating samples')
-    parser.add_argument('--guidance_scale', type=float, default=3.0, 
-                        help='Guidance strength for generation')
-    
+
+    # Visualization parameters
+    parser.add_argument(
+        "--vis_every_n_epochs",
+        type=int,
+        default=1,
+        help="Generate progress images every N epochs",
+    )
+    parser.add_argument(
+        "--vis_num_samples",
+        type=int,
+        default=1,
+        help="Number of samples to generate per condition",
+    )
+    parser.add_argument(
+        "--inference_steps",
+        type=int,
+        default=50,
+        help="Inference steps for generating samples",
+    )
+    parser.add_argument(
+        "--guidance_scale",
+        type=float,
+        default=3.0,
+        help="Guidance strength for generation",
+    )
+
     # Gradient accumulation
     parser.add_argument(
-        "--accumulate_grad_batches", type=int, default=1, 
-        help="Number of batches to accumulate gradients for"
+        "--accumulate_grad_batches",
+        type=int,
+        default=3,
+        help="Number of batches to accumulate gradients for",
     )
-    
+
     args = parser.parse_args()
 
     # Create necessary directories
     os.makedirs("checkpoints/cfg_diffusion", exist_ok=True)
     os.makedirs("logs/cfg_diffusion", exist_ok=True)
+
+    # Set seed for reproducibility
+    pl.seed_everything(args.seed)
 
     # Train classifier-free guided diffusion model
     train_cfg_diffusion(args)

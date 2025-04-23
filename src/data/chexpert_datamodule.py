@@ -1,99 +1,41 @@
 """
 PyTorch Lightning DataModule for CheXpert dataset.
-Modified to incorporate preprocessing from original implementation.
 """
 
-import logging
 import os
 
 import numpy as np
 import pandas as pd
 import pytorch_lightning as pl
 import torch
-from PIL import Image
+import torchvision.io as io
 from torch.utils.data import DataLoader, Dataset, random_split
 from torchvision import transforms
-
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
 
 
 class CheXpertDataset(Dataset):
     """
     CheXpert dataset for multi-label classification of chest X-rays.
-    Incorporates preprocessing from original implementation.
     """
 
     def __init__(
         self,
-        csv_file,
-        base_dir,
-        transform=None,
-        use_frontal_only=True,
-        debug_mode=False,
-        policy="ones",
-        class_index=None,
-        use_metadata=True,
+        csv_file: str,
+        base_dir: str,
+        transform: transforms.Compose = None,
+        debug_mode: bool = False,
+        class_index: list = None,
+        img_size=224,
     ):
         """
         Args:
             csv_file: Path to the csv file with annotations.
-            base_dir: Base directory containing train/valid folders.
+            base_dir: Base directory containing images.
             transform: Optional transform to be applied on a sample.
-            use_frontal_only: If True, only use frontal views.
             debug_mode: If True, only use a small subset of data for debugging.
-            policy: How to handle uncertain labels: 'ones', 'zeros', 'ignore'.
             class_index: Which classes to use (defaults to all 14).
-            use_metadata: Whether to include metadata in the labels.
+            img_size: Size for image resizing.
         """
-        # Read the CSV file
-        self.data_frame = pd.read_csv(csv_file)
-        self.use_metadata = use_metadata
-
-        # -------------------
-        # Filter and clean df - Using preprocessing from original implementation
-
-        # Age - Grouped
-        self.data_frame = self.data_frame[self.data_frame["Age"] > 1]
-        age_bins = [18, 44, 64, 79, np.inf]
-        self.data_frame["Age"] = np.digitize(
-            self.data_frame["Age"], bins=age_bins, right=True
-        ).astype(np.int64)
-
-        # Sex (0 - Female, 1 - Male)
-        self.data_frame["Sex"] = self.data_frame["Sex"].apply(
-            lambda x: 1 if x == "Male" else 0
-        )
-
-        # Frontal, AP/PA - AP/PA in (0 - None, 1 - AP, 2 - PA)
-        self.data_frame["AP/PA"] = self.data_frame["AP/PA"].apply(
-            lambda x: 1 if x == "AP" else 2 if x == "PA" else 0
-        )
-        self.data_frame["Frontal/Lateral"] = self.data_frame["Frontal/Lateral"].apply(
-            lambda x: 1 if x == "Frontal" else 0
-        )
-
-        # Apply frontal filtering if requested
-        if use_frontal_only:
-            logger.info("Filtering for frontal views only")
-            self.data_frame = self.data_frame[self.data_frame["Frontal/Lateral"] == 1]
-
-        # Replace all NaN values in findings with 0
-        self.data_frame = self.data_frame.fillna(0)
-        self.data_frame = self.data_frame.reset_index(drop=True)
-        # -------------------
-
-        # Use a small subset for debugging if requested
-        if debug_mode:
-            logger.info("Debug mode enabled - using only 5000 samples")
-            self.data_frame = self.data_frame.iloc[:8000]
-
-        # Store directory and transform
-        self.base_dir = base_dir
-        self.transform = transform
-        self.policy = policy
 
         # Define findings (labels) list
         self.findings = [
@@ -113,10 +55,37 @@ class CheXpertDataset(Dataset):
             "Support Devices",
         ]
 
-        # Define metadata fields
-        self.metadata = ["Sex", "Age", "Frontal/Lateral", "AP/PA"]
+        # Load and filter data
+        df = pd.read_csv(csv_file)
 
-        # Allow filtering for specific classes
+        # Filter for frontal images with AP projection
+        filtered_df = df[(df["Frontal/Lateral"] == "Frontal") & (df["AP/PA"] == "AP")]
+
+        # Fill NA values and convert -1.0 to 0.0
+        filtered_df = filtered_df.fillna(0.0).replace(-1.0, 0.0)
+
+        # Select only necessary columns
+        filtered_df = filtered_df[["Path"] + self.findings]
+
+        self.data_frame = filtered_df
+
+        # Debug mode to use a small subset
+        if debug_mode:
+            self.data_frame = self.data_frame.iloc[: min(10000, len(self.data_frame))]
+
+        # Balance the dataset
+        self.data_frame = self._balance_dataset(
+            self.data_frame,
+            min_ratio=0.05,
+            max_samples_per_class=1000,
+        )
+
+        # Set up class variables
+        self.base_dir = base_dir
+        self.transform = transform
+        self.img_size = img_size
+
+        # Configure class indices (class indices are
         if class_index is None:
             self.class_index = list(range(len(self.findings)))
         else:
@@ -124,71 +93,101 @@ class CheXpertDataset(Dataset):
 
         self.classes = [self.findings[i] for i in self.class_index]
 
-        # Apply the policy for uncertain labels
-        self._apply_policy()
+    def _balance_dataset(self, df, min_ratio=0.05, max_samples_per_class=None):
+        """
+        Balances the dataset to improve the representation of minority classes.
 
-    def _apply_policy(self):
-        """Apply the selected policy for uncertain labels (-1)"""
-        if self.policy == "ones":
-            self.data_frame.loc[:, self.classes] = self.data_frame.loc[
-                :, self.classes
-            ].replace(-1, 1)
-        elif self.policy == "zeros":
-            self.data_frame.loc[:, self.classes] = self.data_frame.loc[
-                :, self.classes
-            ].replace(-1, 0)
-        elif self.policy == "ignore":
-            pass
-        else:
-            raise ValueError(f"Unknown policy: {self.policy}")
+        Args:
+            df: Original DataFrame
+            min_ratio: Minimum desired ratio for each class
+            max_samples_per_class: Maximum number of samples per class
+
+        Returns:
+            Balanced DataFrame
+        """
+        # Initialize a set for selected indices
+        selected_indices = set()
+
+        # For each medical finding, select samples in a balanced manner
+        for finding in self.findings:
+            positive_samples = df[df[finding] == 1]
+            negative_samples = df[df[finding] == 0]
+
+            # Determine the number of samples to select
+            positive_count = len(positive_samples)
+
+            # If there are very few positive samples, take all of them
+            if positive_count < 100:
+                sample_size = positive_count
+            else:
+                # Define a sample size based on the minimum desired ratio
+                # and limited by max_samples_per_class if specified
+                sample_size = min(
+                    positive_count,
+                    int(len(df) * min_ratio),
+                    max_samples_per_class if max_samples_per_class else float("inf"),
+                )
+
+            # Take a random balanced sample
+            if sample_size < positive_count:
+                pos_indices = positive_samples.sample(sample_size).index.tolist()
+            else:
+                pos_indices = positive_samples.index.tolist()
+
+            neg_indices = negative_samples.sample(
+                min(sample_size * 2, len(negative_samples))
+            ).index.tolist()
+
+            # Add the selected indices to the set
+            selected_indices.update(pos_indices)
+            selected_indices.update(neg_indices)
+
+        # Create a new DataFrame with the selected indices
+        balanced_df = df.loc[list(selected_indices)]
+
+        # Show the size of the original and balanced datasets
+        print(f"Original dataset size: {len(df)}")
+        print(f"Balanced dataset size: {len(balanced_df)}")
+
+        return balanced_df
 
     def __len__(self):
         return len(self.data_frame)
 
     def __getitem__(self, idx):
-        if torch.is_tensor(idx):
-            idx = idx.tolist()
+        """
+        Get a sample from the dataset, optimized for performance.
+        """
 
-        # Get the image path from the Path column
-        path_in_csv = self.data_frame.iloc[idx]["Path"]
+        # Get image path
+        img_path = self.data_frame.iloc[idx]["Path"]
 
-        # Handle the "CheXpert-v1.0-small" prefix in the CSV
-        if path_in_csv.startswith("CheXpert-v1.0-small/"):
-            # Remove the prefix
-            path_in_csv = path_in_csv[len("CheXpert-v1.0-small/") :]
+        # Read the image using torchvision
+        image = io.read_image(img_path, mode=io.ImageReadMode.GRAY)
 
-        # Construct the full path
-        img_path = os.path.join(self.base_dir, path_in_csv)
+        # Convert to float and normalize
+        image = image.float() / 255.0
 
-        # Log the path being used (only for the first few images)
-        if idx < 3:
-            logger.info(f"Loading image at path: {img_path}")
+        # Redimensionar
+        if image.shape[1] != self.img_size or image.shape[2] != self.img_size:
+            image = torch.nn.functional.interpolate(
+                image.unsqueeze(0),
+                size=(self.img_size, self.img_size),
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(0)
 
-        # Load the image as grayscale (L mode) as in the first implementation
-        try:
-            image = Image.open(img_path).convert("L")
-        except Exception as e:
-            logger.error(f"Error loading image {img_path}: {e}")
-            # Create a gray image as fallback
-            image = Image.new("L", (224, 224), color=128)
+        # Normalize(mean=0.5, std=0.5)
+        image = image * 2.0 - 1.0
 
-        # Transform the image if needed
+        labels = torch.tensor(
+            self.data_frame.iloc[idx][self.classes].values.astype(np.float32)
+        )
+
         if self.transform:
             image = self.transform(image)
 
-        # Feature only labels using the class index
-        labels = torch.tensor(
-            self.data_frame.loc[idx, self.classes].values.astype(np.float32)
-        )
-
-        # If you want Age, Sex, F/L, AP/PA
-        if self.use_metadata:
-            metadata = torch.tensor(
-                self.data_frame.loc[idx, self.metadata].values.astype(np.float32)
-            )
-            labels = torch.cat([labels, metadata], dim=0)
-
-        return image, labels
+        return image, labels  # (1, img_size, img_size), (num_classes)
 
 
 class CheXpertDataModule(pl.LightningDataModule):
@@ -202,54 +201,30 @@ class CheXpertDataModule(pl.LightningDataModule):
         img_size=224,
         batch_size=16,
         num_workers=4,
-        use_frontal_only=True,
         seed=42,
         debug_mode=False,
         pin_memory=True,
-        policy="ones",
         class_index=None,
-        use_metadata=True,
     ):
         super().__init__()
         self.data_dir = data_dir
         self.img_size = img_size
         self.batch_size = batch_size
         self.num_workers = num_workers
-        self.use_frontal_only = use_frontal_only
         self.seed = seed
         self.debug_mode = debug_mode
         self.pin_memory = pin_memory
-        self.policy = policy
         self.class_index = class_index
-        self.use_metadata = False  # use_metadata
 
-        # Define transforms using the normalization parameters from the first implementation
-        self.train_transform = transforms.Compose(
-            [
-                transforms.Resize((img_size, img_size)),
-                transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=[0.5], std=[0.3]
-                ),  # Original implementation values
-            ]
-        )
-
-        self.val_transform = transforms.Compose(
-            [
-                transforms.Resize((img_size, img_size)),
-                transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=[0.5], std=[0.3]
-                ),  # Original implementation values
-            ]
+        self.transform = (
+            None  # No transform is applied in the dataset (all done in dataset class)
         )
 
     def prepare_data(self):
-        """Check if data directory exists."""
+        """Check if data directory and required files exist."""
         if not os.path.exists(self.data_dir):
             raise ValueError(f"Data directory not found: {self.data_dir}")
 
-        # Check for train.csv and valid.csv
         train_csv = os.path.join(self.data_dir, "train.csv")
         valid_csv = os.path.join(self.data_dir, "valid.csv")
 
@@ -258,91 +233,42 @@ class CheXpertDataModule(pl.LightningDataModule):
         if not os.path.exists(valid_csv):
             raise FileNotFoundError(f"Valid CSV file not found: {valid_csv}")
 
-        # Log the data directory
-        logger.info(f"Using data directory: {self.data_dir}")
-        logger.info(f"Train CSV exists: {os.path.exists(train_csv)}")
-        logger.info(f"Valid CSV exists: {os.path.exists(valid_csv)}")
-
     def setup(self, stage=None):
-        """Set up the dataset splits."""
-        # Find the CSV files
+        """Set up train, validation, and test datasets."""
         train_csv = os.path.join(self.data_dir, "train.csv")
         valid_csv = os.path.join(self.data_dir, "valid.csv")
 
-        logger.info(f"Using train CSV: {train_csv}")
-        logger.info(f"Using valid CSV: {valid_csv}")
-
         if stage == "fit" or stage is None:
-            logger.info("Setting up training dataset...")
-            # Set up training dataset with our updated CheXpertDataset class
             self.train_dataset = CheXpertDataset(
                 csv_file=train_csv,
                 base_dir=self.data_dir,
-                transform=self.train_transform,
-                use_frontal_only=self.use_frontal_only,
+                transform=self.transform,
                 debug_mode=self.debug_mode,
-                policy=self.policy,
                 class_index=self.class_index,
-                use_metadata=self.use_metadata,
+                img_size=self.img_size,
             )
 
-            logger.info("Setting up validation dataset...")
-            # Set up validation dataset
-            self.val_dataset = CheXpertDataset(
+            val_dataset = CheXpertDataset(
                 csv_file=valid_csv,
                 base_dir=self.data_dir,
-                transform=self.val_transform,
-                use_frontal_only=self.use_frontal_only,
+                transform=self.transform,
                 debug_mode=self.debug_mode,
-                policy=self.policy,
                 class_index=self.class_index,
-                use_metadata=self.use_metadata,
+                img_size=self.img_size,
             )
 
             # Split validation into val and test
-            logger.info("Splitting validation dataset into val and test sets...")
-            val_size = int(0.9 * len(self.val_dataset))
-            test_size = len(self.val_dataset) - val_size
+            val_size = int(0.9 * len(val_dataset))
+            test_size = len(val_dataset) - val_size
 
             self.val_dataset, self.test_dataset = random_split(
-                self.val_dataset,
+                val_dataset,
                 [val_size, test_size],
                 generator=torch.Generator().manual_seed(self.seed),
             )
 
-            logger.info(f"Train dataset size: {len(self.train_dataset)}")
-            logger.info(f"Validation dataset size: {len(self.val_dataset)}")
-            logger.info(f"Test dataset size: {len(self.test_dataset)}")
-
-        if stage == "test" or stage is None:
-            # If we're just testing and haven't set up datasets yet
-            if not hasattr(self, "test_dataset"):
-                logger.info("Setting up test dataset...")
-                val_dataset = CheXpertDataset(
-                    csv_file=valid_csv,
-                    base_dir=self.data_dir,
-                    transform=self.val_transform,
-                    use_frontal_only=self.use_frontal_only,
-                    debug_mode=self.debug_mode,
-                    policy=self.policy,
-                    class_index=self.class_index,
-                    use_metadata=self.use_metadata,
-                )
-
-                # Split validation into val and test
-                val_size = int(0.9 * len(val_dataset))
-                test_size = len(val_dataset) - val_size
-
-                _, self.test_dataset = random_split(
-                    val_dataset,
-                    [val_size, test_size],
-                    generator=torch.Generator().manual_seed(self.seed),
-                )
-
-                logger.info(f"Test dataset size: {len(self.test_dataset)}")
-
     def train_dataloader(self):
-        """Return the training dataloader."""
+        """Return training dataloader."""
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
@@ -354,7 +280,7 @@ class CheXpertDataModule(pl.LightningDataModule):
         )
 
     def val_dataloader(self):
-        """Return the validation dataloader."""
+        """Return validation dataloader."""
         return DataLoader(
             self.val_dataset,
             batch_size=self.batch_size,
@@ -366,7 +292,7 @@ class CheXpertDataModule(pl.LightningDataModule):
         )
 
     def test_dataloader(self):
-        """Return the test dataloader."""
+        """Return test dataloader."""
         return DataLoader(
             self.test_dataset,
             batch_size=self.batch_size,
@@ -376,6 +302,3 @@ class CheXpertDataModule(pl.LightningDataModule):
             drop_last=False,
             persistent_workers=self.num_workers > 0,
         )
-
-
-
