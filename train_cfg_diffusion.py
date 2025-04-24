@@ -18,7 +18,7 @@ from pytorch_lightning.callbacks import (
     LearningRateMonitor,
     ModelCheckpoint,
 )
-from pytorch_lightning.loggers import NeptuneLogger, TensorBoardLogger
+from pytorch_lightning.loggers import NeptuneLogger
 
 from src.data.chexpert_datamodule import CheXpertDataModule
 from src.models.cfg_diffusion import ClassifierFreeGuidedDiffusion
@@ -100,14 +100,6 @@ def train_cfg_diffusion(args):
         )
         loggers.append(neptune_logger)
     
-    # TensorBoard Logger (always available)
-    tensorboard_logger = TensorBoardLogger(
-        save_dir="logs",
-        name="cfg_diffusion",
-        version=datetime.now().strftime("%Y%m%d_%H%M%S")
-    )
-    loggers.append(tensorboard_logger)
-
     # Set up callbacks
     callbacks = []
     
