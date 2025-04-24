@@ -1,0 +1,17 @@
+torch
+torchvision
+pytorch-lightning
+torchmetrics
+numpy
+matplotlib
+tqdm
+einops
+scikit-learn
+scipy
+kagglehub
+pillow
+pandas
+torch-ema
+neptune
+dotenv
+diffusers
