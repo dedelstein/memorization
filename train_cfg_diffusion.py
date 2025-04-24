@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Script to train a Classifier-Free Guided Diffusion model on the CheXpert dataset.
-Updated to work with the optimized ClassifierFreeGuidedDiffusion implementation.
+Updated to work with the simplified ClassifierFreeGuidedDiffusion implementation.
 """
 
 import argparse
@@ -37,10 +37,6 @@ def train_cfg_diffusion(args):
     """
     print("=== Training Classifier-Free Guided Diffusion Model ===")
 
-    # Set device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-
     # Configure tensor computation precision
     if torch.cuda.is_available():
         torch.set_float32_matmul_precision("medium")
@@ -56,29 +52,22 @@ def train_cfg_diffusion(args):
         pin_memory=True,
     )
 
-    # Create optimized diffusion model with new parameters
+    # Create simplified diffusion model
     model = ClassifierFreeGuidedDiffusion(
         pretrained_model_name_or_path=args.pretrained_model_path
         if args.pretrained_model_path
         else None,
         img_size=args.img_size,
-        in_channels=1,
-        out_channels=1,
         num_classes=len(CHEXPERT_CLASSES),
         conditioning_dropout_prob=args.dropout_prob,
         lr=args.lr,
         lr_warmup_steps=args.lr_warmup_steps,
         optimizer_type=args.optimizer_type,
         
-        # New parameters for optimized training
+        # Scheduler parameters
         lr_scheduler_type=args.lr_scheduler_type,
         min_lr=args.min_lr,
         lr_num_cycles=args.lr_num_cycles,
-        
-        # EMA parameters
-        use_ema=args.use_ema,
-        ema_decay=args.ema_decay,
-        ema_update_every=args.ema_update_every,
         
         # Noise scheduler parameters
         noise_scheduler_beta_schedule=args.beta_schedule,
@@ -193,7 +182,7 @@ def main():
     )
 
     # Training parameters
-    parser.add_argument("--batch_size", type=int, default=2, help="Batch size")
+    parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
     parser.add_argument("--epochs", type=int, default=50, help="Number of epochs")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument(
@@ -203,7 +192,7 @@ def main():
         help="Number of warmup steps for learning rate scheduler"
     )
     
-    # New scheduler parameters
+    # Scheduler parameters
     parser.add_argument(
         "--lr_scheduler_type",
         type=str,
@@ -222,26 +211,6 @@ def main():
         type=int,
         default=1,
         help="Number of cycles for cosine scheduler with restarts",
-    )
-    
-    # EMA parameters
-    parser.add_argument(
-        "--use_ema",
-        action="store_true",
-        default=True,
-        help="Use Exponential Moving Average for model parameters",
-    )
-    parser.add_argument(
-        "--ema_decay",
-        type=float,
-        default=0.9999,
-        help="EMA decay rate (higher = slower updating)",
-    )
-    parser.add_argument(
-        "--ema_update_every",
-        type=int,
-        default=1,
-        help="Update EMA every N steps",
     )
     
     parser.add_argument(
@@ -300,7 +269,7 @@ def main():
     parser.add_argument(
         "--inference_steps",
         type=int,
-        default=50,
+        default=25,
         help="Inference steps for generating samples",
     )
     parser.add_argument(
@@ -314,7 +283,7 @@ def main():
     parser.add_argument(
         "--accumulate_grad_batches",
         type=int,
-        default=3,
+        default=5,
         help="Number of batches to accumulate gradients for",
     )
 

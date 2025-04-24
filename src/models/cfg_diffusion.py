@@ -11,7 +11,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers import DDIMScheduler, DDPMScheduler, UNet2DConditionModel
 from diffusers.optimization import get_scheduler
-from torch_ema import ExponentialMovingAverage
 
 from src.utils.constants import CHEXPERT_CLASSES
 
@@ -25,25 +24,16 @@ class ClassifierFreeGuidedDiffusion(pl.LightningModule):
         self,
         pretrained_model_name_or_path: Optional[str] = None,
         img_size: int = 64,
-        in_channels: int = 1,
-        out_channels: int = 1,
         num_classes: int = len(CHEXPERT_CLASSES),
-        center_crop_size: Optional[int] = None,
-        random_flip: bool = True,
         conditioning_dropout_prob: float = 0.1,
         lr: float = 1e-4,
         lr_warmup_steps: int = 500,
         optimizer_type: str = "AdamW",
-        # Nuevo parámetro para el tipo de scheduler
         lr_scheduler_type: str = "cosine_with_warmup",
-        # Parámetros adicionales para schedulers avanzados
         min_lr: float = 1e-6,
         lr_num_cycles: int = 1,
         noise_scheduler_beta_schedule: str = "linear",
         noise_scheduler_num_train_timesteps: int = 1000,
-        use_ema: bool = True,
-        ema_decay: float = 0.9999,
-        ema_update_every: int = 1,
     ):
         """
         Initialize the Classifier-Free Guided Diffusion model.
@@ -51,11 +41,7 @@ class ClassifierFreeGuidedDiffusion(pl.LightningModule):
         Args:
             pretrained_model_name_or_path: Path to pretrained model or model identifier from huggingface.co/models
             img_size: Size of the input image (assumed square)
-            in_channels: Number of input channels
-            out_channels: Number of output channels
             num_classes: Number of classes for conditional generation
-            center_crop_size: Size for center cropping input images
-            random_flip: Whether to randomly flip input images
             conditioning_dropout_prob: Probability of dropping class conditioning for CFG training
             lr: Learning rate
             lr_warmup_steps: Number of warmup steps for learning rate scheduler
@@ -66,9 +52,6 @@ class ClassifierFreeGuidedDiffusion(pl.LightningModule):
             lr_num_cycles: Number of cycles for cosine scheduler with restarts
             noise_scheduler_beta_schedule: Schedule for noise variance
             noise_scheduler_num_train_timesteps: Number of diffusion steps
-            use_ema: Whether to use EMA model
-            ema_decay: EMA decay rate (higher = slower updating)
-            ema_update_every: Update EMA every N steps
         """
         super().__init__()
         self.save_hyperparameters()
@@ -81,22 +64,9 @@ class ClassifierFreeGuidedDiffusion(pl.LightningModule):
         else:
             self.unet = UNet2DConditionModel(
                 sample_size=img_size,
-                in_channels=in_channels,
-                out_channels=out_channels,
-                layers_per_block=2,
-                block_out_channels=(64, 128, 256, 512),
-                down_block_types=(
-                    "CrossAttnDownBlock2D",
-                    "CrossAttnDownBlock2D",
-                    "CrossAttnDownBlock2D",
-                    "DownBlock2D",
-                ),
-                up_block_types=(
-                    "UpBlock2D",
-                    "CrossAttnUpBlock2D",
-                    "CrossAttnUpBlock2D",
-                    "CrossAttnUpBlock2D",
-                ),
+                layers_per_block=1,
+                in_channels=1,
+                out_channels=1,
                 cross_attention_dim=num_classes,
             )
 
@@ -106,55 +76,17 @@ class ClassifierFreeGuidedDiffusion(pl.LightningModule):
             num_train_timesteps=noise_scheduler_num_train_timesteps,
         )
 
-        # EMA settings - We'll initialize the actual EMA model in on_fit_start
-        self.use_ema = use_ema
-        self.ema_decay = ema_decay
-        self.ema_update_every = ema_update_every
-        self.ema = None
-        self.ema_unet = None  # Para almacenar una copia del modelo con pesos EMA
-        self._step_counter = 0  # Contador privado para EMA updates
-
         # Conditioning dropout probability
         self.conditioning_dropout_prob = conditioning_dropout_prob
 
-    def on_fit_start(self):
-        """
-        Called at the beginning of training after model has been moved to the correct device.
-        This is the perfect place to initialize the EMA model since we know the device.
-        """
-        if self.use_ema:
-            # Create a clone of the UNet model before applying EMA
-            # We need to create the clone before getting parameters to avoid issues with compiled models
-            self.ema_unet = UNet2DConditionModel(**self.unet.config)
-            
-            # First copy the weights directly (safer than load_state_dict with compiled models)
-            with torch.no_grad():
-                for param_ema, param_model in zip(self.ema_unet.parameters(), self.unet.parameters()):
-                    param_ema.data.copy_(param_model.data)
-            
-            # Move the EMA model to the correct device
-            self.ema_unet.to(self.device)
-            
-            # Initialize EMA using pytorch_ema
-            self.ema = ExponentialMovingAverage(
-                self.unet.parameters(), decay=self.ema_decay
-            )
-
-            print(
-                f"EMA initialized on device: {self.device} with decay: {self.ema_decay}"
-            )
-
-    def prepare_latents(self, batch_size, channels, height, width, device=None):
+    def prepare_latents(self, batch_size, channels, height, width):
         """
         Prepare random noise as input to the diffusion process.
         """
-        if device is None:
-            device = self.device
-
-        # Generate random noise
+        # Generate random noise - PyTorch Lightning will handle device placement
         latents = torch.randn(
             (batch_size, channels, height, width),
-            device=device,
+            device=self.device,
         )
 
         return latents
@@ -183,10 +115,6 @@ class ClassifierFreeGuidedDiffusion(pl.LightningModule):
         """
         images, labels = batch
 
-        # Move data to the correct device
-        images = images.to(self.device)
-        labels = labels.to(self.device)
-
         # Convert images to latent space if needed
         latents = images
 
@@ -199,7 +127,7 @@ class ClassifierFreeGuidedDiffusion(pl.LightningModule):
             0,
             self.noise_scheduler.config.num_train_timesteps,
             (bsz,),
-            device=latents.device,
+            device=self.device,
         ).long()
 
         # Add noise to the latents according to the noise magnitude at each timestep
@@ -211,7 +139,7 @@ class ClassifierFreeGuidedDiffusion(pl.LightningModule):
         # Classifier-free guidance: randomly drop conditioning with probability conditioning_dropout_prob
         if self.training and self.conditioning_dropout_prob > 0:
             mask = torch.bernoulli(
-                torch.ones(bsz, device=encoder_hidden_states.device)
+                torch.ones(bsz, device=self.device)
                 * (1 - self.conditioning_dropout_prob)
             ).view(bsz, 1, 1)
 
@@ -226,43 +154,13 @@ class ClassifierFreeGuidedDiffusion(pl.LightningModule):
         # Log metrics
         self.log("train_loss", loss, prog_bar=True)
 
-        # Incrementar contador de pasos interno
-        self._step_counter += 1
-
         return loss
-
-    def on_after_backward(self):
-        """
-        Llamado después de calcular gradientes y antes de actualizarlos.
-        Es un buen lugar para actualizar EMA porque los parámetros aún no han cambiado.
-        """
-        if (
-            self.use_ema
-            and self.ema is not None
-            and self._step_counter % self.ema_update_every == 0
-        ):
-            self.ema.update(self.unet.parameters())
-
-    def _get_model_for_evaluation(self):
-        """
-        Método privado para obtener el modelo adecuado para evaluación/generación.
-        """
-        if not self.use_ema or self.ema is None:
-            return self.unet
-
-        # Para evaluación, aplicamos los pesos de EMA a una copia del modelo
-        self.ema.copy_to(self.ema_unet.parameters())
-        return self.ema_unet
 
     def validation_step(self, batch, batch_idx):
         """
         Validation step for conditional diffusion models.
         """
         images, labels = batch
-
-        # Move data to the correct device
-        images = images.to(self.device)
-        labels = labels.to(self.device)
 
         # Convert images to latent space if needed
         latents = images
@@ -276,7 +174,7 @@ class ClassifierFreeGuidedDiffusion(pl.LightningModule):
             0,
             self.noise_scheduler.config.num_train_timesteps,
             (bsz,),
-            device=latents.device,
+            device=self.device,
         ).long()
 
         # Add noise to the latents according to the noise magnitude at each timestep
@@ -285,17 +183,14 @@ class ClassifierFreeGuidedDiffusion(pl.LightningModule):
         # Get the condition embedding for the labels
         encoder_hidden_states = self.encode_condition(labels)
 
-        # Get model for prediction (EMA or regular)
-        model = self._get_model_for_evaluation()
-
         # Predict the noise residual
-        noise_pred = model(noisy_latents, timesteps, encoder_hidden_states).sample
+        noise_pred = self.unet(noisy_latents, timesteps, encoder_hidden_states).sample
 
         # Calculate loss
         loss = F.mse_loss(noise_pred, noise)
 
         # Log metrics
-        self.log("val_loss", loss, prog_bar=True, sync_dist=True)  # sync_dist=True para entrenamiento multi-GPU
+        self.log("val_loss", loss, prog_bar=True)  
 
         return loss
 
@@ -324,7 +219,6 @@ class ClassifierFreeGuidedDiffusion(pl.LightningModule):
         scheduler_type = self.hparams.lr_scheduler_type.lower()
         
         if scheduler_type == "constant_with_warmup":
-            # Scheduler con tasa constante después del warmup (original)
             scheduler = get_scheduler(
                 name="constant_with_warmup",
                 optimizer=optimizer,
@@ -334,9 +228,6 @@ class ClassifierFreeGuidedDiffusion(pl.LightningModule):
             scheduler_config = {"scheduler": scheduler, "interval": "step"}
             
         elif scheduler_type == "cosine_with_warmup":
-            # Coseno con warmup (mejora para modelos de difusión)
-            # Using PyTorch's CosineAnnealingWarmRestarts instead of diffusers' get_scheduler
-            # First create a warmup scheduler
             warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
                 optimizer,
                 start_factor=0.001,
@@ -362,19 +253,17 @@ class ClassifierFreeGuidedDiffusion(pl.LightningModule):
             scheduler_config = {"scheduler": scheduler, "interval": "step"}
             
         elif scheduler_type == "one_cycle":
-            # One Cycle Policy (bueno para entrenamientos rápidos)
             scheduler = torch.optim.lr_scheduler.OneCycleLR(
                 optimizer,
                 max_lr=self.hparams.lr,
                 total_steps=total_steps,
-                pct_start=0.3,  # 30% del tiempo para warming up
-                div_factor=25.0,  # lr_inicial = max_lr/div_factor
-                final_div_factor=10000.0,  # lr_final = lr_inicial/final_div_factor
+                pct_start=0.3,  # 30% time for warming up
+                div_factor=25.0,  # lr_initial = max_lr/div_factor
+                final_div_factor=10000.0,  # lr_final = lr_initial/final_div_factor
             )
             scheduler_config = {"scheduler": scheduler, "interval": "step"}
             
         elif scheduler_type == "reduce_on_plateau":
-            # Reduce on Plateau (para cuando no estamos seguros del tiempo de entrenamiento)
             scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 optimizer,
                 mode="min",
@@ -406,8 +295,6 @@ class ClassifierFreeGuidedDiffusion(pl.LightningModule):
             "optimizer": optimizer,
             "lr_scheduler": scheduler_config,
         }
-        
-    
 
     def generate_samples(
         self,
@@ -431,8 +318,7 @@ class ClassifierFreeGuidedDiffusion(pl.LightningModule):
             Generated images (and optionally intermediate results)
         """
         # Set model to evaluation mode
-        model = self._get_model_for_evaluation()
-        model.eval()
+        self.unet.eval()
 
         # Use DDIM scheduler for faster sampling
         ddim_scheduler = DDIMScheduler.from_config(self.noise_scheduler.config)
@@ -441,14 +327,15 @@ class ClassifierFreeGuidedDiffusion(pl.LightningModule):
         # Create random noise
         latents = self.prepare_latents(
             batch_size=batch_size,
-            channels=model.config.in_channels,
-            height=model.config.sample_size,
-            width=model.config.sample_size,
+            channels=self.unet.config.in_channels,
+            height=self.unet.config.sample_size,
+            width=self.unet.config.sample_size,
         )
 
         # Move labels to the correct device if provided
         if labels is not None:
-            labels = labels.to(self.device)
+            # PyTorch Lightning will handle device placement
+            pass
         else:
             # Default to "No Finding" if no labels provided
             labels = torch.zeros(
@@ -482,7 +369,7 @@ class ClassifierFreeGuidedDiffusion(pl.LightningModule):
                     )
 
                     # Get the noise predictions
-                    noise_pred = model(
+                    noise_pred = self.unet(
                         latent_model_input,
                         t,
                         encoder_hidden_states=combined_embeddings,
@@ -494,7 +381,7 @@ class ClassifierFreeGuidedDiffusion(pl.LightningModule):
                         noise_pred_text - noise_pred_uncond
                     )
                 else:
-                    noise_pred = model(
+                    noise_pred = self.unet(
                         latents,
                         t,
                         encoder_hidden_states=encoder_hidden_states,
@@ -528,47 +415,3 @@ class ClassifierFreeGuidedDiffusion(pl.LightningModule):
         # Scale to [0, 255] and convert to uint8
         images = (images * 255).type(torch.uint8)
         return images
-        
-    def on_save_checkpoint(self, checkpoint):
-        """
-        Save EMA state in the checkpoint.
-        """
-        if self.use_ema and self.ema is not None:
-            checkpoint["ema_state_dict"] = self.ema.state_dict()
-            
-            # También guardamos los pesos del modelo EMA para cargar más fácilmente
-            if self.ema_unet is not None:
-                checkpoint["ema_unet_state_dict"] = self.ema_unet.state_dict()
-
-    def on_load_checkpoint(self, checkpoint):
-        """
-        Load EMA state from the checkpoint.
-        """
-        # Inicializar EMA si estamos usándolo
-        if self.use_ema:
-            # Si no tenemos un EMA unet todavía, creamos uno
-            if self.ema_unet is None:
-                self.ema_unet = UNet2DConditionModel(**self.unet.config)
-                
-                # Si el checkpoint tiene los pesos del EMA unet, los cargamos directamente
-                if "ema_unet_state_dict" in checkpoint:
-                    self.ema_unet.load_state_dict(checkpoint["ema_unet_state_dict"])
-                else:
-                    # En caso contrario, inicializamos con los pesos actuales del modelo
-                    with torch.no_grad():
-                        for param_ema, param_model in zip(self.ema_unet.parameters(), self.unet.parameters()):
-                            param_ema.data.copy_(param_model.data)
-                
-                # Moverlo al dispositivo correcto
-                if hasattr(self, 'device'):
-                    self.ema_unet.to(self.device)
-            
-            # Inicializar el objeto EMA si no existe
-            if self.ema is None:
-                self.ema = ExponentialMovingAverage(self.unet.parameters(), decay=self.ema_decay)
-                
-            # Cargar el estado del EMA si existe en el checkpoint
-            if "ema_state_dict" in checkpoint:
-                self.ema.load_state_dict(checkpoint["ema_state_dict"])
-            else:
-                self.logger.warning("Estado EMA no encontrado en el checkpoint pero use_ema=True. Inicializando nuevo EMA.")
