@@ -2,15 +2,21 @@
 Classifier-Free Guidance implementation using the diffusers library.
 """
 
-import os
-from typing import Dict, List, Optional, Union
+import inspect
+
+import torch
+import torch.nn.functional as F
+
+
+from diffusers import DDPMPipeline, DDPMScheduler, UNet2DModel
+from diffusers.optimization import get_scheduler
+from diffusers.training_utils import EMAModel
+from diffusers.utils.import_utils import is_xformers_available
+
+
 
 import pytorch_lightning as pl
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from diffusers import DDIMScheduler, DDPMScheduler, UNet2DConditionModel
-from diffusers.optimization import get_scheduler
+from diffusers import UNet2DConditionModel
 
 from src.utils.constants import CHEXPERT_CLASSES
 
@@ -22,396 +28,513 @@ class ClassifierFreeGuidedDiffusion(pl.LightningModule):
 
     def __init__(
         self,
-        pretrained_model_name_or_path: Optional[str] = None,
-        img_size: int = 64,
-        num_classes: int = len(CHEXPERT_CLASSES),
-        conditioning_dropout_prob: float = 0.1,
-        lr: float = 1e-4,
-        lr_warmup_steps: int = 500,
-        optimizer_type: str = "AdamW",
-        lr_scheduler_type: str = "cosine_with_warmup",
-        min_lr: float = 1e-6,
-        lr_num_cycles: int = 1,
-        noise_scheduler_beta_schedule: str = "linear",
-        noise_scheduler_num_train_timesteps: int = 1000,
+        sample_size=64,
+        in_channels=1,
+        out_channels=1,
+        
+        learning_rate=1e-4,
+        lr_scheduler="cosine",
+        lr_warmup_steps=500,
+        adam_beta1=0.95,
+        adam_beta2=0.999,
+        adam_weight_decay=1e-6,
+        adam_epsilon=1e-08,
+        use_ema=True,
+        ema_inv_gamma=1.0,
+        ema_power=3/4,
+        ema_max_decay=0.9999,
+        ddpm_num_steps=1000,
+        ddpm_beta_schedule="linear",
+        prediction_type="epsilon",
+        enable_xformers_memory_efficient_attention=False,
+        class_cond=True,
+        num_classes=len(CHEXPERT_CLASSES),
+        unconditional_probability=0.1,
+        guidance_scale=5.0,
+        **kwargs
     ):
-        """
-        Initialize the Classifier-Free Guided Diffusion model.
-
-        Args:
-            pretrained_model_name_or_path: Path to pretrained model or model identifier from huggingface.co/models
-            img_size: Size of the input image (assumed square)
-            num_classes: Number of classes for conditional generation
-            conditioning_dropout_prob: Probability of dropping class conditioning for CFG training
-            lr: Learning rate
-            lr_warmup_steps: Number of warmup steps for learning rate scheduler
-            optimizer_type: Type of optimizer to use
-            lr_scheduler_type: Type of learning rate scheduler (constant_with_warmup, cosine_with_warmup, 
-                               one_cycle, reduce_on_plateau)
-            min_lr: Minimum learning rate for cosine scheduler
-            lr_num_cycles: Number of cycles for cosine scheduler with restarts
-            noise_scheduler_beta_schedule: Schedule for noise variance
-            noise_scheduler_num_train_timesteps: Number of diffusion steps
-        """
         super().__init__()
         self.save_hyperparameters()
-
-        # Create the UNet model
-        if pretrained_model_name_or_path:
-            self.unet = UNet2DConditionModel.from_pretrained(
-                pretrained_model_name_or_path, subfolder="unet"
+        
+        # Model parameters
+        self.sample_size = sample_size
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        
+        
+        # Optimizer parameters
+        self.learning_rate = learning_rate
+        self.lr_scheduler = lr_scheduler
+        self.lr_warmup_steps = lr_warmup_steps
+        self.adam_beta1 = adam_beta1
+        self.adam_beta2 = adam_beta2
+        self.adam_weight_decay = adam_weight_decay
+        self.adam_epsilon = adam_epsilon
+        
+        # EMA parameters
+        self.use_ema = use_ema
+        self.ema_inv_gamma = ema_inv_gamma
+        self.ema_power = ema_power
+        self.ema_max_decay = ema_max_decay
+        self.ema_model = None  # Will be initialized in setup()
+        
+        # Diffusion parameters
+        self.ddpm_num_steps = ddpm_num_steps
+        self.ddpm_beta_schedule = ddpm_beta_schedule
+        self.prediction_type = prediction_type
+        
+        # Classifier-free guidance parameters
+        self.class_cond = class_cond
+        self.num_classes = num_classes
+        self.unconditional_probability = unconditional_probability
+        self.guidance_scale = guidance_scale
+        
+        # Performance optimizations
+        self.enable_xformers_memory_efficient_attention = enable_xformers_memory_efficient_attention
+        
+        # Initialize model
+        if self.class_cond:
+            self.model = UNet2DConditionModel(
+                sample_size=self.sample_size,
+                in_channels=self.in_channels,
+                out_channels=self.out_channels,
+                layers_per_block=2,
+                block_out_channels=(128, 128, 256, 256, 512, 512),
+                down_block_types=(
+                    "DownBlock2D",
+                    "DownBlock2D",
+                    "DownBlock2D",
+                    "DownBlock2D",
+                    "AttnDownBlock2D",
+                    "DownBlock2D",
+                ),
+                up_block_types=(
+                    "UpBlock2D",
+                    "AttnUpBlock2D",
+                    "UpBlock2D",
+                    "UpBlock2D",
+                    "UpBlock2D",
+                    "UpBlock2D",
+                ),
+                # Use text embeddings for conditioning
+                cross_attention_dim=self.num_classes,
+            )
+            
+            # Create a simple class embedder
+            self.class_embedder = torch.nn.Linear(
+                self.num_classes, self.num_classes
             )
         else:
-            self.unet = UNet2DConditionModel(
-                sample_size=img_size,
-                layers_per_block=1,
-                in_channels=1,
-                out_channels=1,
-                cross_attention_dim=num_classes,
+            self.model = UNet2DModel(
+                sample_size=self.sample_size,
+                in_channels=self.in_channels,
+                out_channels=self.out_channels,
+                layers_per_block=2,
+                block_out_channels=(128, 128, 256, 256, 512, 512),
+                down_block_types=(
+                    "DownBlock2D",
+                    "DownBlock2D",
+                    "DownBlock2D",
+                    "DownBlock2D",
+                    "AttnDownBlock2D",
+                    "DownBlock2D",
+                ),
+                up_block_types=(
+                    "UpBlock2D",
+                    "AttnUpBlock2D",
+                    "UpBlock2D",
+                    "UpBlock2D",
+                    "UpBlock2D",
+                    "UpBlock2D",
+                ),
             )
-
-        # Create noise scheduler
-        self.noise_scheduler = DDPMScheduler(
-            beta_schedule=noise_scheduler_beta_schedule,
-            num_train_timesteps=noise_scheduler_num_train_timesteps,
-        )
-
-        # Conditioning dropout probability
-        self.conditioning_dropout_prob = conditioning_dropout_prob
-
-    def prepare_latents(self, batch_size, channels, height, width):
+            
+        # Enable xformers if requested
+        if self.enable_xformers_memory_efficient_attention:
+            if is_xformers_available():
+                self.model.enable_xformers_memory_efficient_attention()
+            else:
+                print("Warning: xformers is not available. Make sure it is installed correctly.")
+        
+        # Initialize noise scheduler
+        accepts_prediction_type = "prediction_type" in set(inspect.signature(DDPMScheduler.__init__).parameters.keys())
+        if accepts_prediction_type:
+            self.noise_scheduler = DDPMScheduler(
+                num_train_timesteps=self.ddpm_num_steps,
+                beta_schedule=self.ddpm_beta_schedule,
+                prediction_type=self.prediction_type,
+            )
+        else:
+            self.noise_scheduler = DDPMScheduler(
+                num_train_timesteps=self.ddpm_num_steps,
+                beta_schedule=self.ddpm_beta_schedule
+            )
+    
+    def setup(self, stage=None):
         """
-        Prepare random noise as input to the diffusion process.
+        Called when the trainer is initializing, ensure EMA model is on the correct device.
         """
-        # Generate random noise - PyTorch Lightning will handle device placement
-        latents = torch.randn(
-            (batch_size, channels, height, width),
-            device=self.device,
-        )
-
-        return latents
-
-    def encode_condition(self, labels):
+        if self.use_ema and self.ema_model is None:
+            # Initialize EMA model with parameters on the same device
+            self.ema_model = EMAModel(
+                self.model.parameters(),
+                decay=self.ema_max_decay,
+                use_ema_warmup=True,
+                inv_gamma=self.ema_inv_gamma,
+                power=self.ema_power,
+                model_cls=UNet2DConditionModel if self.class_cond else UNet2DModel,
+                model_config=self.model.config,
+                device=self.device
+            )
+    
+    def forward(self, noisy_images, timesteps, class_labels=None):
         """
-        Encode class labels for conditioning.
-
-        Args:
-            labels: One-hot encoded class labels [batch_size, num_classes]
-
-        Returns:
-            Encoded condition for UNet in the format [batch_size, sequence_length=1, hidden_dim]
+        Forward pass through the model
         """
-        # UNet2DConditionModel expects encoder_hidden_states to be of shape [batch_size, sequence_length, hidden_dim]
-        # For our case, we'll use sequence_length=1 and treat num_classes as hidden_dim
-        if labels is None:
-            return None
-
-        # Reshape to add sequence_length dimension [batch_size, num_classes] -> [batch_size, 1, num_classes]
-        return labels.unsqueeze(1)
-
+        if self.class_cond and class_labels is not None:
+            # Convert class labels to embeddings for cross-attention conditioning
+            encoder_hidden_states = self.class_embedder(class_labels)
+            
+            # Reshape to [batch_size, seq_length, hidden_dim]
+            # For cross-attention, we need a sequence dimension
+            batch_size = encoder_hidden_states.shape[0]
+            # Add a sequence length dimension of 1 (one token per image)
+            encoder_hidden_states = encoder_hidden_states.unsqueeze(1)
+            
+            return self.model(noisy_images, timesteps, encoder_hidden_states=encoder_hidden_states).sample
+        else:
+            return self.model(noisy_images, timesteps).sample
+    
+    def _extract_into_tensor(self, arr, timesteps, broadcast_shape):
+        """
+        Extract values from a 1-D numpy array for a batch of indices.
+        
+        :param arr: the 1-D numpy array.
+        :param timesteps: a tensor of indices into the array to extract.
+        :param broadcast_shape: a larger shape of K dimensions with the batch
+                                dimension equal to the length of timesteps.
+        :return: a tensor of shape [batch_size, 1, ...] where the shape has K dims.
+        """
+        if not isinstance(arr, torch.Tensor):
+            arr = torch.from_numpy(arr)
+        res = arr[timesteps].float().to(timesteps.device)
+        while len(res.shape) < len(broadcast_shape):
+            res = res[..., None]
+        return res.expand(broadcast_shape)
+    
     def training_step(self, batch, batch_idx):
         """
-        Training step for conditional diffusion models.
+        Training step
         """
-        images, labels = batch
-
-        # Convert images to latent space if needed
-        latents = images
-
-        # Sample noise that we'll add to the latents
-        noise = torch.randn_like(latents)
-        bsz = latents.shape[0]
-
+        clean_images = batch["image"]
+        
+        # For classifier-free guidance, we need to handle class labels
+        if self.class_cond:
+            class_labels = batch.get("labels", None)
+            
+            # Randomly set some labels to zeros for classifier-free guidance training
+            if class_labels is not None and self.unconditional_probability > 0:
+                mask = torch.rand(class_labels.shape[0], device=class_labels.device) < self.unconditional_probability
+                class_labels = torch.where(mask[:, None], torch.zeros_like(class_labels), class_labels)
+        else:
+            class_labels = None
+        
+        # Sample noise
+        noise = torch.randn(clean_images.shape, device=clean_images.device)
+        bsz = clean_images.shape[0]
+        
         # Sample a random timestep for each image
         timesteps = torch.randint(
-            0,
-            self.noise_scheduler.config.num_train_timesteps,
-            (bsz,),
-            device=self.device,
+            0, self.noise_scheduler.config.num_train_timesteps, (bsz,), device=clean_images.device
         ).long()
-
-        # Add noise to the latents according to the noise magnitude at each timestep
-        noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
-
-        # Get the condition embedding for the labels
-        encoder_hidden_states = self.encode_condition(labels)
-
-        # Classifier-free guidance: randomly drop conditioning with probability conditioning_dropout_prob
-        if self.training and self.conditioning_dropout_prob > 0:
-            mask = torch.bernoulli(
-                torch.ones(bsz, device=self.device)
-                * (1 - self.conditioning_dropout_prob)
-            ).view(bsz, 1, 1)
-
-            encoder_hidden_states = encoder_hidden_states * mask
-
+        
+        # Add noise to the clean images according to the noise magnitude at each timestep
+        noisy_images = self.noise_scheduler.add_noise(clean_images, noise, timesteps)
+        
         # Predict the noise residual
-        noise_pred = self.unet(noisy_latents, timesteps, encoder_hidden_states).sample
-
-        # Calculate loss
-        loss = F.mse_loss(noise_pred, noise)
-
-        # Log metrics
-        self.log("train_loss", loss, prog_bar=True)
-
+        model_output = self(noisy_images, timesteps, class_labels)
+        
+        # Calculate loss based on prediction type
+        if self.prediction_type == "epsilon":
+            loss = F.mse_loss(model_output, noise)
+        elif self.prediction_type == "sample":
+            alpha_t = self._extract_into_tensor(
+                self.noise_scheduler.alphas_cumprod, timesteps, (clean_images.shape[0], 1, 1, 1)
+            )
+            snr_weights = alpha_t / (1 - alpha_t)
+            # use SNR weighting from distillation paper
+            loss = snr_weights * F.mse_loss(model_output, clean_images, reduction="none")
+            loss = loss.mean()
+        else:
+            raise ValueError(f"Unsupported prediction type: {self.prediction_type}")
+        
+        # Update EMA model as part of the training step
+        if self.use_ema and self.trainer.global_step > 0:
+            if self.ema_model is None:
+                self.setup()  # Ensure EMA is initialized
+            self.ema_model.to(self.device)
+            self.ema_model.step(self.model.parameters())
+        
+        # Log loss
+        self.log("train_loss", loss, prog_bar=True, logger=True)
+        
         return loss
-
+    
     def validation_step(self, batch, batch_idx):
         """
-        Validation step for conditional diffusion models.
+        Validation step - calculate loss on validation data
         """
-        images, labels = batch
-
-        # Convert images to latent space if needed
-        latents = images
-
-        # Sample noise that we'll add to the latents
-        noise = torch.randn_like(latents)
-        bsz = latents.shape[0]
-
+        clean_images = batch["image"]
+        
+        if self.class_cond:
+            class_labels = batch.get("labels", None)
+        else:
+            class_labels = None
+        
+        # Sample noise
+        noise = torch.randn(clean_images.shape, device=clean_images.device)
+        bsz = clean_images.shape[0]
+        
         # Sample a random timestep for each image
         timesteps = torch.randint(
-            0,
-            self.noise_scheduler.config.num_train_timesteps,
-            (bsz,),
-            device=self.device,
+            0, self.noise_scheduler.config.num_train_timesteps, (bsz,), device=clean_images.device
         ).long()
-
-        # Add noise to the latents according to the noise magnitude at each timestep
-        noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
-
-        # Get the condition embedding for the labels
-        encoder_hidden_states = self.encode_condition(labels)
-
+        
+        # Add noise to the clean images
+        noisy_images = self.noise_scheduler.add_noise(clean_images, noise, timesteps)
+        
         # Predict the noise residual
-        noise_pred = self.unet(noisy_latents, timesteps, encoder_hidden_states).sample
-
-        # Calculate loss
-        loss = F.mse_loss(noise_pred, noise)
-
-        # Log metrics
-        self.log("val_loss", loss, prog_bar=True)  
-
+        model_output = self(noisy_images, timesteps, class_labels)
+        
+        # Calculate loss based on prediction type
+        if self.prediction_type == "epsilon":
+            loss = F.mse_loss(model_output, noise)
+        elif self.prediction_type == "sample":
+            alpha_t = self._extract_into_tensor(
+                self.noise_scheduler.alphas_cumprod, timesteps, (clean_images.shape[0], 1, 1, 1)
+            )
+            snr_weights = alpha_t / (1 - alpha_t)
+            loss = snr_weights * F.mse_loss(model_output, clean_images, reduction="none")
+            loss = loss.mean()
+        
+        # Log validation loss
+        self.log("val_loss", loss, prog_bar=True, logger=True)
+        
         return loss
-
+    
+    def on_validation_epoch_end(self):
+        """
+        Generate and log sample images at the end of validation
+        """
+        # Skip if not on main process or not time to generate samples
+        if not self.trainer.is_global_zero:
+            return
+        
+        # Use EMA model if available
+        if self.use_ema and self.ema_model is not None:
+            # Store current model parameters
+            stored_params = [param.clone() for param in self.model.parameters()]
+            # Copy EMA parameters to model
+            self.ema_model.copy_to(self.model.parameters())
+        
+        # Sample images with the model
+        if self.class_cond:
+            # Create condition labels for sampling (one per class)
+            class_labels = torch.eye(self.num_classes, device=self.device)
+            # Also add an unconditional sample
+            class_labels = torch.cat([torch.zeros(1, self.num_classes, device=self.device), class_labels], dim=0)
+            
+            # Sample with classifier-free guidance
+            with torch.no_grad():
+                # Initialize noise
+                image_shape = (class_labels.shape[0], self.in_channels, self.sample_size, self.sample_size)
+                noise = torch.randn(image_shape, device=self.device)
+                
+                # Progressive denoising
+                images = noise
+                for t in self.noise_scheduler.timesteps:
+                    timesteps = torch.full((class_labels.shape[0],), t, device=self.device, dtype=torch.long)
+                    
+                    # Predict noise for both conditional and unconditional
+                    with torch.no_grad():
+                        # Create embeddings for unconditional generation
+                        unconditional_embeddings = self.class_embedder(torch.zeros_like(class_labels))
+                        # Add sequence dimension
+                        unconditional_embeddings = unconditional_embeddings.unsqueeze(1)
+                        
+                        unconditional_output = self.model(
+                            images, 
+                            timesteps, 
+                            encoder_hidden_states=unconditional_embeddings
+                        ).sample
+                        
+                        # Conditional prediction with class embeddings
+                        conditional_embeddings = self.class_embedder(class_labels)
+                        # Add sequence dimension
+                        conditional_embeddings = conditional_embeddings.unsqueeze(1)
+                        
+                        conditional_output = self.model(
+                            images, 
+                            timesteps, 
+                            encoder_hidden_states=conditional_embeddings
+                        ).sample
+                        
+                        # Apply classifier-free guidance
+                        model_output = unconditional_output + self.guidance_scale * (conditional_output - unconditional_output)
+                    
+                    # Denoise one step
+                    images = self.noise_scheduler.step(model_output, t, images).prev_sample
+        else:
+            # Use diffusers pipeline for non-conditional sampling
+            pipeline = DDPMPipeline(
+                unet=self.model,
+                scheduler=self.noise_scheduler,
+            )
+            
+            with torch.no_grad():
+                images = pipeline(
+                    batch_size=4,
+                    generator=torch.manual_seed(self.trainer.current_epoch),
+                    output_type="tensor",
+                ).images
+        
+        # Restore original model parameters if EMA was used
+        if self.use_ema and self.ema_model is not None:
+            for param, stored in zip(self.model.parameters(), stored_params):
+                param.data.copy_(stored.data)
+        
+        # Log images
+        if hasattr(self.logger, "experiment"):
+            self.logger.experiment.add_images(
+                f"generated_samples/epoch_{self.trainer.current_epoch}", 
+                (images + 1) / 2,  # Normalize from [-1, 1] to [0, 1]
+                self.trainer.global_step
+            )
+    
     def configure_optimizers(self):
         """
-        Configure optimizers and learning rate scheduler.
+        Configure optimizers and learning rate schedulers
         """
-        if self.hparams.optimizer_type.lower() == "adamw":
-            optimizer = torch.optim.AdamW(
-                self.unet.parameters(),
-                lr=self.hparams.lr,
-                betas=(0.9, 0.999),
-                weight_decay=1e-6,
-                eps=1e-8,
-            )
-        else:
-            optimizer = torch.optim.Adam(
-                self.unet.parameters(),
-                lr=self.hparams.lr,
-                betas=(0.9, 0.999),
-                eps=1e-8,
-            )
-
-        # Usar diferentes tipos de scheduler según la configuración
-        total_steps = self.trainer.estimated_stepping_batches
-        scheduler_type = self.hparams.lr_scheduler_type.lower()
+        # Create optimizer
+        optimizer = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=self.learning_rate,
+            betas=(self.adam_beta1, self.adam_beta2),
+            weight_decay=self.adam_weight_decay,
+            eps=self.adam_epsilon,
+        )
         
-        if scheduler_type == "constant_with_warmup":
-            scheduler = get_scheduler(
-                name="constant_with_warmup",
-                optimizer=optimizer,
-                num_warmup_steps=self.hparams.lr_warmup_steps,
-                num_training_steps=total_steps,
-            )
-            scheduler_config = {"scheduler": scheduler, "interval": "step"}
-            
-        elif scheduler_type == "cosine_with_warmup":
-            warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
-                optimizer,
-                start_factor=0.001,
-                end_factor=1.0,
-                total_iters=self.hparams.lr_warmup_steps
-            )
-            
-            # Then create a cosine scheduler
-            cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-                optimizer,
-                T_0=total_steps - self.hparams.lr_warmup_steps,
-                T_mult=1,
-                eta_min=self.hparams.min_lr
-            )
-            
-            # Combine them into a sequential scheduler
-            scheduler = torch.optim.lr_scheduler.SequentialLR(
-                optimizer,
-                schedulers=[warmup_scheduler, cosine_scheduler],
-                milestones=[self.hparams.lr_warmup_steps]
-            )
-            
-            scheduler_config = {"scheduler": scheduler, "interval": "step"}
-            
-        elif scheduler_type == "one_cycle":
-            scheduler = torch.optim.lr_scheduler.OneCycleLR(
-                optimizer,
-                max_lr=self.hparams.lr,
-                total_steps=total_steps,
-                pct_start=0.3,  # 30% time for warming up
-                div_factor=25.0,  # lr_initial = max_lr/div_factor
-                final_div_factor=10000.0,  # lr_final = lr_initial/final_div_factor
-            )
-            scheduler_config = {"scheduler": scheduler, "interval": "step"}
-            
-        elif scheduler_type == "reduce_on_plateau":
-            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer,
-                mode="min",
-                factor=0.5,
-                patience=5,
-                min_lr=self.hparams.min_lr,
-                verbose=True,
-            )
-            scheduler_config = {
-                "scheduler": scheduler, 
-                "interval": "epoch", 
-                "monitor": "val_loss",
-                "frequency": 1
-            }
-        else:
-            # Default to constant_with_warmup as safe option
-            self.logger.warning(
-                f"Unknown scheduler type: {scheduler_type}. Using constant_with_warmup as default."
-            )
-            scheduler = get_scheduler(
-                name="constant_with_warmup",
-                optimizer=optimizer,
-                num_warmup_steps=self.hparams.lr_warmup_steps,
-                num_training_steps=total_steps,
-            )
-            scheduler_config = {"scheduler": scheduler, "interval": "step"}
-
+        # Create learning rate scheduler
+        scheduler = get_scheduler(
+            self.lr_scheduler,
+            optimizer=optimizer,
+            num_warmup_steps=self.lr_warmup_steps,
+            num_training_steps=self.trainer.estimated_stepping_batches,
+        )
+        
         return {
             "optimizer": optimizer,
-            "lr_scheduler": scheduler_config,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+                "frequency": 1,
+            },
         }
-
-    def generate_samples(
-        self,
-        batch_size=4,
-        labels=None,
-        guidance_scale=3.0,
-        num_inference_steps=50,
-        return_all_timesteps=False,
-    ):
+    
+    def on_save_checkpoint(self, checkpoint):
         """
-        Generate samples using the classifier-free guided diffusion model.
+        Include EMA model state in checkpoint
+        """
+        if self.use_ema:
+            checkpoint["ema_model"] = self.ema_model.state_dict()
+    
+    def on_load_checkpoint(self, checkpoint):
+        """
+        Load EMA model state from checkpoint
+        """
+        if self.use_ema and "ema_model" in checkpoint:
+            self.ema_model.load_state_dict(checkpoint["ema_model"])
 
+    def generate_samples(self, batch_size=4, labels=None, guidance_scale=3.0, num_inference_steps=50, noise=None):
+        """
+        Generate samples with the model.
+        
         Args:
-            batch_size: Number of images to generate
-            labels: Optional labels for conditional generation
+            batch_size: Number of samples to generate
+            labels: Conditioning labels for generation (if None, use unconditional generation)
             guidance_scale: Strength of classifier-free guidance (higher = stronger conditioning)
-            num_inference_steps: Number of inference steps
-            return_all_timesteps: Whether to return intermediate results
-
+            num_inference_steps: Number of denoising steps
+            noise: Optional initial noise. If None, random noise will be used.
+            
         Returns:
-            Generated images (and optionally intermediate results)
+            Generated image tensors
         """
-        # Set model to evaluation mode
-        self.unet.eval()
-
-        # Use DDIM scheduler for faster sampling
-        ddim_scheduler = DDIMScheduler.from_config(self.noise_scheduler.config)
-        ddim_scheduler.set_timesteps(num_inference_steps)
-
-        # Create random noise
-        latents = self.prepare_latents(
-            batch_size=batch_size,
-            channels=self.unet.config.in_channels,
-            height=self.unet.config.sample_size,
-            width=self.unet.config.sample_size,
-        )
-
-        # Move labels to the correct device if provided
-        if labels is not None:
-            # PyTorch Lightning will handle device placement
-            pass
+        # Store device for use throughout the method
+        device = self.device
+        
+        # Initialize with random noise if not provided
+        if noise is None:
+            shape = (batch_size, self.in_channels, self.sample_size, self.sample_size)
+            noise = torch.randn(shape, device=device)
+            self.last_used_noise = noise  # Store for potential reuse
         else:
-            # Default to "No Finding" if no labels provided
-            labels = torch.zeros(
-                (batch_size, len(CHEXPERT_CLASSES)), device=self.device
+            self.last_used_noise = noise  # Store the provided noise
+            
+        # Configure scheduler for inference
+        self.noise_scheduler.set_timesteps(num_inference_steps)
+            
+        # Start from pure noise
+        images = noise
+        
+        # For conditional model, apply classifier-free guidance
+        if self.class_cond and labels is not None:
+            with torch.no_grad():
+                # Progressive denoising with classifier-free guidance
+                for t in self.noise_scheduler.timesteps:
+                    # Expand the timesteps tensor for batch dimension
+                    timesteps = torch.full((batch_size,), t, device=device, dtype=torch.long)
+                    
+                    # Create unconditional embeddings (zero labels)
+                    unconditional_embeddings = self.class_embedder(torch.zeros_like(labels))
+                    # Add sequence dimension (batch_size, 1, hidden_dim)
+                    unconditional_embeddings = unconditional_embeddings.unsqueeze(1)
+                    
+                    # Predict unconditional noise residual
+                    unconditional_output = self.model(
+                        images, 
+                        timesteps, 
+                        encoder_hidden_states=unconditional_embeddings
+                    ).sample
+                    
+                    # Predict conditional noise residual
+                    conditional_embeddings = self.class_embedder(labels)
+                    # Add sequence dimension (batch_size, 1, hidden_dim)
+                    conditional_embeddings = conditional_embeddings.unsqueeze(1)
+                    
+                    conditional_output = self.model(
+                        images, 
+                        timesteps, 
+                        encoder_hidden_states=conditional_embeddings
+                    ).sample
+                    
+                    # Apply classifier-free guidance formula
+                    model_output = unconditional_output + guidance_scale * (conditional_output - unconditional_output)
+                    
+                    # Denoise one step
+                    images = self.noise_scheduler.step(model_output, t, images).prev_sample
+        else:
+            # For unconditional generation, use standard diffusers pipeline
+            pipeline = DDPMPipeline(
+                unet=self.model,
+                scheduler=self.noise_scheduler,
             )
-            labels[:, CHEXPERT_CLASSES.index("No Finding")] = 1.0
-
-        # Encode condition
-        encoder_hidden_states = self.encode_condition(labels)
-
-        # Prepare unconditional embedding for classifier-free guidance
-        if guidance_scale > 1.0:
-            uncond_embedding = torch.zeros_like(encoder_hidden_states)
-
-        # Store intermediate results if requested
-        timestep_latents = []
-
-        # Generate samples using DDIM
-        with torch.no_grad():
-            for i, t in enumerate(ddim_scheduler.timesteps):
-                # expand the latents if we are doing classifier free guidance
-                latent_model_input = (
-                    torch.cat([latents] * 2) if guidance_scale > 1.0 else latents
-                )
-
-                # predict the noise residual
-                if guidance_scale > 1.0:
-                    # Concatenate condition and unconditional embeddings for batch processing
-                    combined_embeddings = torch.cat(
-                        [uncond_embedding, encoder_hidden_states]
-                    )
-
-                    # Get the noise predictions
-                    noise_pred = self.unet(
-                        latent_model_input,
-                        t,
-                        encoder_hidden_states=combined_embeddings,
-                    ).sample
-
-                    # Perform guidance
-                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                    noise_pred = noise_pred_uncond + guidance_scale * (
-                        noise_pred_text - noise_pred_uncond
-                    )
-                else:
-                    noise_pred = self.unet(
-                        latents,
-                        t,
-                        encoder_hidden_states=encoder_hidden_states,
-                    ).sample
-
-                # compute the previous noisy sample x_t -> x_t-1
-                latents = ddim_scheduler.step(noise_pred, t, latents).prev_sample
-
-                # Save intermediate result if requested
-                if return_all_timesteps:
-                    timestep_latents.append(latents.clone())
-
-        # Denormalize latents if needed (for UNet output)
-        images = self.denormalize_latents(latents)
-
-        # Return results
-        if return_all_timesteps:
-            # Denormalize all timestep latents
-            timestep_images = [self.denormalize_latents(l) for l in timestep_latents]
-            return images, timestep_images
-        else:
-            return images
-
-    def denormalize_latents(self, latents):
-        """
-        Denormalize latents to image space. For direct UNet output, this is a simple
-        scaling and shifting from [-1, 1] to [0, 255].
-        """
-        # Scale from [-1, 1] to [0, 1]
-        images = (latents * 0.5 + 0.5).clamp(0, 1)
-        # Scale to [0, 255] and convert to uint8
-        images = (images * 255).type(torch.uint8)
+            
+            with torch.no_grad():
+                images = pipeline(
+                    batch_size=batch_size,
+                    generator=torch.manual_seed(0),
+                    output_type="tensor",
+                    num_inference_steps=num_inference_steps
+                ).images
+                
         return images

@@ -7,18 +7,16 @@ from datetime import datetime
 import math
 
 import matplotlib.pyplot as plt
-import numpy as np
 import torch
 from pytorch_lightning.callbacks import Callback
 from pytorch_lightning.loggers import NeptuneLogger
-from neptune.types import File
 
 from src.utils.constants import CHEXPERT_CLASSES
 
 
 class ProgressVisualizationCallback(Callback):
     """
-    Callback that generates and saves images every 10 epochs during training
+    Callback that generates and saves images during training
     to visualize improvements in generation quality.
     """
 
@@ -90,16 +88,12 @@ class ProgressVisualizationCallback(Callback):
 
     def _prepare_image_for_display(self, img):
         """Convert tensor image to numpy array ready for display."""
-        img_np = img.cpu().numpy() / 255.0
-
-        # Handle different tensor shapes properly
-        if img_np.shape[0] == 1:  # Single channel (grayscale)
-            # Remove the channel dimension to get a 2D array for grayscale
-            img_np = np.squeeze(img_np, axis=0)
-        else:  # RGB
-            img_np = np.transpose(img_np, (1, 2, 0))
-
-        return img_np
+        # Handle single-channel (grayscale) images
+        if img.shape[0] == 1:
+            return img.squeeze(0).cpu().numpy() / 255.0
+        # Handle multi-channel (RGB) images
+        else:
+            return img.permute(1, 2, 0).cpu().numpy() / 255.0
 
     def on_epoch_end(self, trainer, pl_module):
         """
@@ -116,7 +110,7 @@ class ProgressVisualizationCallback(Callback):
             return
 
         # Ensure we have a directory for this epoch
-        epoch_dir = os.path.join(self.output_dir, f"epoch_{epoch:03d}")
+        epoch_dir = os.path.join(self.output_dir, f"val_epoch_{epoch:03d}")
         os.makedirs(epoch_dir, exist_ok=True)
 
         print(f"\nGenerating progress images for epoch {epoch}...")
@@ -137,49 +131,41 @@ class ProgressVisualizationCallback(Callback):
                 )
                 labels[:, cond_idx] = 1.0
 
-                # Use fixed noise if enabled
-                if self.fixed_noise:
-                    # Create or retrieve fixed noise for this condition
-                    if cond_name not in self.fixed_noises:
-                        # Generate and save fixed noise
-                        noise = pl_module.prepare_latents(
-                            batch_size=self.num_samples,
-                            channels=pl_module.unet.config.in_channels,
-                            height=pl_module.unet.config.sample_size,
-                            width=pl_module.unet.config.sample_size,
-                        )
-                        self.fixed_noises[cond_name] = noise
+                # Generate samples
+                samples = pl_module.generate_samples(
+                    batch_size=self.num_samples,
+                    labels=labels,
+                    guidance_scale=self.guidance_scale,
+                    num_inference_steps=self.inference_steps,
+                    noise=self.fixed_noises.get(cond_name) if self.fixed_noise else None
+                )
 
-                    # Generate samples with fixed noise
-                    samples = pl_module.generate_samples(
-                        batch_size=self.num_samples,
-                        labels=labels,
-                        guidance_scale=self.guidance_scale,
-                        num_inference_steps=self.inference_steps,
-                    )
-                else:
-                    # Generate samples with random noise
-                    samples = pl_module.generate_samples(
-                        batch_size=self.num_samples,
-                        labels=labels,
-                        guidance_scale=self.guidance_scale,
-                        num_inference_steps=self.inference_steps,
-                    )
+                # Store fixed noise if needed
+                if self.fixed_noise and cond_name not in self.fixed_noises:
+                    # Use the same noise next time
+                    self.fixed_noises[cond_name] = pl_module.last_used_noise
 
-                # Add samples to the collection
+                # Save individual samples in condition-specific directory
+                cond_dir = os.path.join(epoch_dir, cond_name)
+                os.makedirs(cond_dir, exist_ok=True)
+                
+                for j, sample in enumerate(samples):
+                    img_path = os.path.join(cond_dir, f"sample_{j:02d}.png")
+                    plt.imsave(img_path, self._prepare_image_for_display(sample), cmap="gray")
+
+                # Add samples to the collection for the grid
                 all_samples.extend(samples)
                 all_condition_names.extend([cond_name] * len(samples))
 
             # Create a grid with all samples (3 columns)
-            self._create_grid(all_samples, all_condition_names, epoch, epoch_dir)
+            grid_path = self._create_grid(all_samples, all_condition_names, epoch, epoch_dir)
 
             # Log to Neptune if available
             if any(isinstance(logger, NeptuneLogger) for logger in trainer.loggers):
                 for logger in trainer.loggers:
                     if isinstance(logger, NeptuneLogger):
                         try:
-                            grid_path = os.path.join(epoch_dir, f"grid_epoch_{epoch:03d}.png")
-                            logger.experiment[f"images/grid/epoch_{epoch}"].upload(File(grid_path))
+                            logger.experiment[f"images/grid/epoch_{epoch}"].upload(grid_path)
                         except Exception as e:
                             print(f"Error sending images to Neptune: {e}")
                         break
@@ -201,7 +187,7 @@ class ProgressVisualizationCallback(Callback):
         """
         # Calculate grid dimensions
         total_samples = len(samples)
-        n_cols = 3  # Fixed at 3 columns as requested
+        n_cols = 3  # Fixed at 3 columns
         n_rows = math.ceil(total_samples / n_cols)
         
         # Create figure
@@ -214,7 +200,7 @@ class ProgressVisualizationCallback(Callback):
             img_np = self._prepare_image_for_display(img)
             plt.imshow(img_np, cmap="gray")
             plt.axis("off")
-            plt.title(condition, fontsize=12)  # Add condition name as title
+            plt.title(condition, fontsize=12)
         
         # Fill empty subplots if needed
         for idx in range(total_samples, n_rows * n_cols):
@@ -223,7 +209,7 @@ class ProgressVisualizationCallback(Callback):
         
         plt.tight_layout()
         plt.subplots_adjust(top=0.95)  # Adjust space for title
-        grid_path = os.path.join(save_dir, f"grid_epoch_{epoch:03d}.png")
+        grid_path = os.path.join(save_dir, f"val_grid_epoch_{epoch:03d}.png")
         plt.savefig(grid_path, dpi=200)
         plt.close()
         

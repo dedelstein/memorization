@@ -4,7 +4,6 @@ PyTorch Lightning DataModule for CheXpert dataset.
 
 import os
 
-import numpy as np
 import pandas as pd
 import pytorch_lightning as pl
 import torch
@@ -85,7 +84,7 @@ class CheXpertDataset(Dataset):
         self.transform = transform
         self.img_size = img_size
 
-        # Configure class indices (class indices are
+        # Configure class indices
         if class_index is None:
             self.class_index = list(range(len(self.findings)))
         else:
@@ -158,7 +157,6 @@ class CheXpertDataset(Dataset):
         """
         Get a sample from the dataset, optimized for performance.
         """
-
         # Get image path
         img_path = self.data_frame.iloc[idx]["Path"]
 
@@ -168,7 +166,7 @@ class CheXpertDataset(Dataset):
         # Convert to float and normalize
         image = image.float() / 255.0
 
-        # Redimensionar
+        # Resize if needed
         if image.shape[1] != self.img_size or image.shape[2] != self.img_size:
             image = torch.nn.functional.interpolate(
                 image.unsqueeze(0),
@@ -177,17 +175,27 @@ class CheXpertDataset(Dataset):
                 align_corners=False,
             ).squeeze(0)
 
-        # Normalize(mean=0.5, std=0.5)
+        # Normalize to [-1, 1]
         image = image * 2.0 - 1.0
 
-        labels = torch.tensor(
-            self.data_frame.iloc[idx][self.classes].values.astype(np.float32)
-        )
+        # Get labels - Fix for numpy.object_ error
+        try:
+            # First, try direct tensor conversion
+            labels = torch.tensor(
+                self.data_frame.iloc[idx][self.classes].values, dtype=torch.float32
+            )
+        except TypeError:
+            # If that fails, manually convert each value to float
+            label_values = self.data_frame.iloc[idx][self.classes].values
+            labels = torch.tensor(
+                [float(val) for val in label_values], dtype=torch.float32
+            )
 
+        # Apply any additional transforms
         if self.transform:
             image = self.transform(image)
 
-        return image, labels  # (1, img_size, img_size), (num_classes)
+        return {"image": image, "labels": labels}  # Return as dict for compatibility
 
 
 class CheXpertDataModule(pl.LightningDataModule):
@@ -216,9 +224,8 @@ class CheXpertDataModule(pl.LightningDataModule):
         self.pin_memory = pin_memory
         self.class_index = class_index
 
-        self.transform = (
-            None  # No transform is applied in the dataset (all done in dataset class)
-        )
+        # No transform as preprocessing happens in the dataset class
+        self.transform = None
 
     def prepare_data(self):
         """Check if data directory and required files exist."""
