@@ -11,6 +11,7 @@ import torch
 import torchvision.io as io
 from torch.utils.data import DataLoader, Dataset, random_split
 from torchvision import transforms
+from pathlib import Path
 
 
 class CheXpertDataset(Dataset):
@@ -160,7 +161,16 @@ class CheXpertDataset(Dataset):
         """
 
         # Get image path
-        img_path = self.data_frame.iloc[idx]["Path"]
+        raw = self.data_frame.iloc[idx]["Path"]
+        p = Path(raw)
+        
+        if not p.is_absolute():
+            base = Path(self.base_dir)
+            try:
+                p = base / p.relative_to(base.name)
+            except ValueError:
+                p = base / p
+        img_path = str(p)
 
         # Read the image using torchvision
         image = io.read_image(img_path, mode=io.ImageReadMode.GRAY)

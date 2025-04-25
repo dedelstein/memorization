@@ -40,14 +40,7 @@ echo "Setting up environment..."
 module load pandas/2.1.3-python-3.10.13
 module list  # List loaded modules for debugging
 
-# Initialize Conda 
-source /zhome/5c/6/219415/miniconda3/etc/profile.d/conda.sh
-
-# Activate conda environment (replace 'venv' with your actual environment name)
-echo "Activating Conda environment..."
-conda activate memorization
-echo "Python version: $(python --version)"
-echo "Conda version: $(conda --version)"
+source /zhome/91/9/214141/default_venv/bin/activate
 
 # Check GPU before running
 if command -v nvidia-smi &> /dev/null; then
@@ -84,7 +77,5 @@ fi
     echo "============================"
 } > "logs/job_report_${LSB_JOBID}.txt"
 
-# Deactivate the conda environment
-conda deactivate
 
 echo "Job completed"
