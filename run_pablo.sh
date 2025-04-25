@@ -4,8 +4,8 @@
 ###############################################################################
 
 ### -- Job information and resources --
-#BSUB -J DDPM_Training_64_v        # Job name
-#BSUB -q gpuv100             # GPU queue for V100s
+#BSUB -J DDPM_Training_128        # Job name
+#BSUB -q gpua100             # GPU queue for V100s
 #BSUB -n 8                   # Number of cores
 #BSUB -gpu "num=1:mode=exclusive_process"  # Request 1 GPU in exclusive mode
 #BSUB -R "span[hosts=1]"     # All cores on same host
@@ -57,7 +57,7 @@ echo "Starting training at $(date)"
 echo "Command: python3 train_cfg_diffusion.py --batch_size 4"
 
 # Run training
-python3 train_cfg_diffusion.py --batch_size 2 --img_size 64 
+python3 train_cfg_diffusion.py --batch_size 6 --img_size 128 
 
 ### -- Job cleanup and information --
 echo "Training finished at $(date)"

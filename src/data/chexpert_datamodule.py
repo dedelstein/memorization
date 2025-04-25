@@ -17,20 +17,16 @@ from pathlib import Path
 from typing import Optional
 
 class CheXpertDataset(Dataset):
-    """
-    CheXpert dataset for multi-label classification of chest X-rays.
-    """
-
     def __init__(
         self,
-        csv_file: str,
-        base_dir: str,
+        csv_file: Optional[str] = None,        # ← now optional
+        base_dir: str = None,
         transform: transforms.Compose = None,
         debug_mode: bool = False,
         class_index: list = None,
-        img_size=224,
-        data_frame: pd.DataFrame = None,   # ← new
-        balance: bool = False
+        img_size: int = 224,
+        data_frame: pd.DataFrame = None,
+        balance: bool = False,
     ):
         """
         Args:
@@ -64,8 +60,10 @@ class CheXpertDataset(Dataset):
         # If a DataFrame is passed, use it directly; otherwise read csv_file
         if data_frame is not None:
             df = data_frame.copy()
-        else:
+        elif csv_file is not None:
             df = pd.read_csv(csv_file)
+        else:
+            raise ValueError("Either csv_file or data_frame must be provided")
 
         # Filter for frontal images with AP projection
         filtered_df = df[(df["Frontal/Lateral"] == "Frontal") & (df["AP/PA"] == "AP")]
@@ -211,144 +209,76 @@ class CheXpertDataset(Dataset):
 
 
 class CheXpertDataModule(pl.LightningDataModule):
-    """
-    PyTorch Lightning DataModule for the CheXpert dataset.
-    """
-
-    def __init__(
-        self,
-        data_dir,
-        img_size=224,
-        batch_size=16,
-        num_workers=4,
-        seed=42,
-        debug_mode=False,
-        pin_memory=True,
-        class_index=None,
-    ):
-        super().__init__()
-        self.data_dir = data_dir
-        self.img_size = img_size
-        self.batch_size = batch_size
+    def __init__(self, data_dir, img_size=224, batch_size=16, num_workers=4, seed=42, debug_mode=False, pin_memory=True, class_index=None):
+        super().__init__()  # note: no args here :contentReference[oaicite:0]{index=0}&#8203;:contentReference[oaicite:1]{index=1}
+        self.data_dir    = data_dir
+        self.img_size    = img_size
+        self.batch_size  = batch_size
         self.num_workers = num_workers
-        self.seed = seed
-        self.debug_mode = debug_mode
-        self.pin_memory = pin_memory
+        self.seed        = seed
+        self.debug_mode  = debug_mode
+        self.pin_memory  = pin_memory
         self.class_index = class_index
 
-        self.transform = (
-            None  # No transform is applied in the dataset (all done in dataset class)
-        )
-
-    def prepare_data(self):
-        """Check if data directory and required files exist."""
-        if not os.path.exists(self.data_dir):
-            raise ValueError(f"Data directory not found: {self.data_dir}")
-
-        train_csv = os.path.join(self.data_dir, "train.csv")
-        valid_csv = os.path.join(self.data_dir, "valid.csv")
-
-        if not os.path.exists(train_csv):
-            raise FileNotFoundError(f"Train CSV file not found: {train_csv}")
-        if not os.path.exists(valid_csv):
-            raise FileNotFoundError(f"Valid CSV file not found: {valid_csv}")
-
     def setup(self, stage=None):
-        """Set up train and validation datasets (no test split)."""
-        # 1) Load & filter CSVs
+        # 1) Load & filter both CSVs
         train_df = pd.read_csv(os.path.join(self.data_dir, "train.csv"))
         valid_df = pd.read_csv(os.path.join(self.data_dir, "valid.csv"))
-
-        train_df = train_df[
-            (train_df["Frontal/Lateral"] == "Frontal")
-            & (train_df["AP/PA"] == "AP")
+        df = pd.concat([train_df, valid_df], ignore_index=True)
+        df = df[
+            (df["Frontal/Lateral"] == "Frontal") &
+            (df["AP/PA"]          == "AP")
         ].reset_index(drop=True)
 
-        valid_df = valid_df[
-            (valid_df["Frontal/Lateral"] == "Frontal")
-            & (valid_df["AP/PA"] == "AP")
-        ].reset_index(drop=True)
+        # 2) Extract patient_id (the parent folder name)
+        df["patient_id"] = df["Path"].apply(lambda p: os.path.basename(os.path.dirname(p)))
 
-        # 2) Extract patient_id
-        def extract_pid(path):
-            return os.path.basename(path).split("_")[0]
+        # 3) Patient-wise train/val split (80/20)
+        gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=self.seed)
+        train_idx, val_idx = next(gss.split(df, groups=df["patient_id"]))
+        df_train = df.iloc[train_idx].reset_index(drop=True)
+        df_val   = df.iloc[val_idx].reset_index(drop=True)
 
-        train_df["patient_id"] = train_df["Path"].apply(extract_pid)
-        valid_df["patient_id"] = valid_df["Path"].apply(extract_pid)
-
-        # 3) Remove any patients from valid that appear in train
-        valid_df = valid_df[
-            ~valid_df["patient_id"].isin(train_df["patient_id"])
-        ].reset_index(drop=True)
-
-        # 4) (Optional) further split train_df internally if you want an 80/20 train/val—
-        #    otherwise you can train on all of train_df and validate on valid_df.
-        #    Here we'll train on *all* of train_df:
-        df_train = train_df.reset_index(drop=True)
-        df_val   = valid_df.reset_index(drop=True)
-
-        # 5) Instantiate datasets
+        # 4) Instantiate datasets
         if stage in (None, "fit"):
             self.train_dataset = CheXpertDataset(
-                csv_file=None,               # ignore csv_file when data_frame is provided
+                data_frame=df_train,        # no need for csv_file now
                 base_dir=self.data_dir,
-                transform=self.transform,
+                img_size=self.img_size,
                 debug_mode=self.debug_mode,
                 class_index=self.class_index,
-                img_size=self.img_size,
-                data_frame=df_train,        # use our DataFrame directly
-                balance=True
+                balance=True,               # only oversample positives here
             )
             self.val_dataset = CheXpertDataset(
-                csv_file=None,
-                base_dir=self.data_dir,
-                transform=self.transform,
-                debug_mode=self.debug_mode,
-                class_index=self.class_index,
-                img_size=self.img_size,
                 data_frame=df_val,
-                balance=False
+                base_dir=self.data_dir,
+                img_size=self.img_size,
+                debug_mode=False,
+                class_index=self.class_index,
+                balance=False,
             )
+
     def train_dataloader(self):
+        # your patient-weighted sampler code here…
+        patient_ids = self.train_dataset.data_frame["patient_id"]
+        counts = patient_ids.value_counts().to_dict()
+        weights = [1.0/counts[pid] for pid in patient_ids]
+        sampler = torch.utils.data.WeightedRandomSampler(weights, len(weights), replacement=True)
 
-        patient_counts = self.train_dataset.data_frame["patient_id"].value_counts().to_dict()
-        weights = [
-            1.0 / patient_counts[pid]
-            for pid in self.train_dataset.data_frame["patient_id"]
-        ]
-        sampler = torch.utils.data.WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
-
-        """Return training dataloader."""
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
+            sampler=sampler,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
             drop_last=True,
-            persistent_workers=self.num_workers > 0,
-            sampler=sampler
         )
 
     def val_dataloader(self):
-        """Return validation dataloader."""
         return DataLoader(
             self.val_dataset,
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
-            drop_last=False,
-            persistent_workers=self.num_workers > 0,
-        )
-
-    def test_dataloader(self):
-        """Return test dataloader."""
-        return DataLoader(
-            self.test_dataset,
-            batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=self.num_workers,
-            pin_memory=self.pin_memory,
-            drop_last=False,
-            persistent_workers=self.num_workers > 0,
         )
