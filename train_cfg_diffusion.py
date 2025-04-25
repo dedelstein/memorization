@@ -114,7 +114,7 @@ def train_cfg_diffusion(args):
     callbacks.append(checkpoint_callback)
 
     # LR Monitor
-    lr_monitor = LearningRateMonitor(logging_interval="step")
+    lr_monitor = LearningRateMonitor(logging_interval="epoch")
     callbacks.append(lr_monitor)
 
     # Early Stopping
@@ -186,7 +186,7 @@ def main():
 
     # Training parameters
     parser.add_argument("--batch_size", type=int, default=2, help="Batch size")
-    parser.add_argument("--epochs", type=int, default=50, help="Number of epochs")
+    parser.add_argument("--epochs", type=int, default=20, help="Number of epochs")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument(
         "--lr_warmup_steps", 
