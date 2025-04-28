@@ -179,21 +179,18 @@ class CheXpertDataset(Dataset):
         image = image * 2.0 - 1.0
 
         # Get labels - Fix for numpy.object_ error
-        try:
-            # First, try direct tensor conversion
-            labels = torch.tensor(
-                self.data_frame.iloc[idx][self.classes].values, dtype=torch.float32
-            )
-        except TypeError:
-            # If that fails, manually convert each value to float
-            label_values = self.data_frame.iloc[idx][self.classes].values
-            labels = torch.tensor(
-                [float(val) for val in label_values], dtype=torch.float32
-            )
+        # First, try direct tensor conversion
+        labels = torch.tensor(
+            self.data_frame.iloc[idx][self.classes].values, dtype=torch.float32
+        )
+        # except TypeError:
+        #     # If that fails, manually convert each value to float
+        #     label_values = self.data_frame.iloc[idx][self.classes].values
+        #     labels = torch.tensor(
+        #         [float(val) for val in label_values], dtype=torch.float32
+        #     )
 
-        # Apply any additional transforms
-        if self.transform:
-            image = self.transform(image)
+        
 
         return {"image": image, "labels": labels}  # Return as dict for compatibility
 
