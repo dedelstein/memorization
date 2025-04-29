@@ -123,7 +123,7 @@ def train_ambient_diffusion(args):
         max_epochs=args.epochs,
         accelerator="auto",
         devices=1,
-        precision=precision,
+        precision="32",
         logger=loggers,
         callbacks=callbacks,
         log_every_n_steps=args.log_every_n_steps,
