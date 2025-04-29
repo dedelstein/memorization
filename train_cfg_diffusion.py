@@ -177,6 +177,7 @@ def main():
 
     # Model parameters
     parser.add_argument("--img_size", type=int, default=192, help="Image size")
+
     parser.add_argument(
         "--pretrained_model_path",
         type=str,

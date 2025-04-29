@@ -54,6 +54,22 @@ class ClassifierFreeGuidedDiffusion(pl.LightningModule):
             use_scale_shift_norm=False,
         )
 
+        # optionally load pretrained UNet weights
+        if pretrained_model_name_or_path:
+            sd = torch.load(pretrained_model_name_or_path, map_location="cpu")
+            # if you saved just the unet.state_dict():
+            if "state_dict" in sd and "unet" in sd["state_dict"]:
+                # Lightning checkpoint -> strip "unet." prefix
+                unet_sd = {k.replace("unet.", ""):v
+                           for k,v in sd["state_dict"].items()
+                           if k.startswith("unet.")}
+                self.unet.load_state_dict(unet_sd, strict=False)
+            else:
+                # pure UNet state-dict
+                self.unet.load_state_dict(sd, strict=False)
+            print(f"Loaded UNet weights from {pretrained_model_name_or_path}")
+
+
         self.noise_scheduler = DDPMScheduler(
             beta_schedule=noise_scheduler_beta_schedule,
             num_train_timesteps=noise_scheduler_num_train_timesteps,
