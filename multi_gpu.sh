@@ -4,13 +4,12 @@
 ###############################################################################
 
 ### -- Job information and resources --
-#BSUB -J DDPM_Training_128        # Job name
-#BSUB -q gpua100             # GPU queue for V100s
-#BSUB -n 4                   # Number of cores
-#BSUB -gpu "num=1:mode=exclusive_process"  # Request 1 GPU in exclusive mode
+#BSUB -J DDPM_Training_128_v_multi # Job name
+#BSUB -q gpuv100             # GPU queue for V100s
+#BSUB -n 8                   # Number of cores
+#BSUB -gpu "num=2:mode=exclusive_process"  # Request GPU's in exclusive mode
 #BSUB -R "span[hosts=1]"     # All cores on same host
-#BSUB -R "rusage[mem=8GB]"   # 4GB RAM per core
-#BSUB -M 9GB                 # Memory limit per core
+#BSUB -R "rusage[mem=2GB]"   # RAM per core
 #BSUB -W 24:00                # Walltime limit (hours:minutes)
 
 ### -- Notification options --
@@ -19,8 +18,8 @@
 ##BSUB -u your_email_address # Uncomment and change to your email for notifications
 
 ### -- Output options --
-#BSUB -o logs/DDPM_%J.out    # Standard output log
-#BSUB -e logs/DDPM_%J.err    # Error log
+#BSUB -o logs/DDPM_multi_%J.out    # Standard output log
+#BSUB -e logs/DDPM_multi_%J.err    # Error log
 
 ### -- Create log directory if it doesn't exist --
 mkdir -p logs
@@ -42,22 +41,17 @@ module list  # List loaded modules for debugging
 
 source /zhome/91/9/214141/default_venv/bin/activate
 
-# Check GPU before running
-if command -v nvidia-smi &> /dev/null; then
-    echo "GPU allocated: $(nvidia-smi --query-gpu=name --format=csv,noheader)"
-fi
-
 # Set PyTorch memory allocation configuration
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # Set any other environment variables
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=0,1,2,3  # Specify the GPUs to use
 
 ### -- Run the training script --
 echo "Starting training at $(date)"
 echo "Command: python3 train_cfg_diffusion.py --batch_size 4"
 
 # Run training
-python3 train_cfg_diffusion.py --batch_size 6 --img_size 128 
+python3 train_cfg_diffusion.py --batch_size 4 --img_size 64 --gpus 2
 
 ### -- Job cleanup and information --
 echo "Training finished at $(date)"

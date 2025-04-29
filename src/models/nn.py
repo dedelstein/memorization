@@ -9,7 +9,7 @@ import math
 
 import torch as th
 import torch.nn as nn
-
+import torch.nn.functional as F
 
 # PyTorch 1.7 has SiLU, but we support PyTorch 1.5.
 class SiLU(nn.Module):
@@ -20,7 +20,6 @@ class SiLU(nn.Module):
 class GroupNorm32(nn.GroupNorm):
     def forward(self, x):
         return super().forward(x.float()).type(x.dtype)
-
 
 def conv_nd(dims, *args, **kwargs):
     """

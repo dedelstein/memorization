@@ -69,7 +69,6 @@ class ClassifierFreeGuidedDiffusion(pl.LightningModule):
                 self.unet.load_state_dict(sd, strict=False)
             print(f"Loaded UNet weights from {pretrained_model_name_or_path}")
 
-
         self.noise_scheduler = DDPMScheduler(
             beta_schedule=noise_scheduler_beta_schedule,
             num_train_timesteps=noise_scheduler_num_train_timesteps,
@@ -209,4 +208,89 @@ class ClassifierFreeGuidedDiffusion(pl.LightningModule):
             )
             sched_config = {"scheduler": scheduler, "interval": "step"}
         elif st == "cosine_with_warmup":
-            warmup = torch.optim.lr
+            scheduler = get_scheduler(
+            name="cosine",
+            optimizer=optimizer,
+            num_warmup_steps=self.hparams.lr_warmup_steps,
+            num_training_steps=total_steps,
+            num_cycles=self.hparams.lr_num_cycles,
+            )
+            sched_config = {"scheduler": scheduler, "interval": "step"}
+        
+        if scheduler is not None:
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "interval": "step",   # call .step() each training step
+                    # "frequency": 1,     # uncomment to change frequency
+                    # "reduce_on_plateau": False,  # only if you use ReduceLROnPlateau
+                }
+            }
+        else:
+            return optimizer
+
+    @torch.no_grad()
+    def generate_samples(
+        self,
+        labels: Optional[torch.Tensor] = None,
+        batch_size: Optional[int] = None,
+        num_samples: int = 1,
+        guidance_scale: float = 3.0,
+        num_inference_steps: int = 100,
+    ) -> torch.Tensor:
+        """
+        Returns a tensor of shape (N, C, H, W):
+          – If `labels` is given, we generate B * num_samples conditioned samples.
+          – Otherwise, we generate batch_size * num_samples unconditional samples.
+        Sampling is done entirely in float32 to avoid dtype mismatches.
+        """
+        device = self.device
+
+        # 0) Force float32 precision for UNet and latents
+        param_dtype = torch.float32
+        self.unet.to(device=device, dtype=param_dtype)
+        self.unet.dtype = param_dtype
+
+        # 1) Build initial latents + label‐tensor
+        if labels is not None:
+            B, K = labels.shape
+            labels = labels.to(device=device, dtype=param_dtype)
+            labels = labels.unsqueeze(1).repeat(1, num_samples, 1).view(-1, K)
+            N = B * num_samples
+            latents = torch.randn(
+                (N, self.hparams.out_channels, self.hparams.img_size, self.hparams.img_size),
+                device=device,
+                dtype=param_dtype,
+            )
+        elif batch_size is not None:
+            N = batch_size * num_samples
+            labels = None
+            latents = torch.randn(
+                (N, self.hparams.out_channels, self.hparams.img_size, self.hparams.img_size),
+                device=device,
+                dtype=param_dtype,
+            )
+        else:
+            raise ValueError("generate_samples requires either `labels` or `batch_size`")
+
+        # 2) Prepare DDIM sampler
+        sampler = DDIMScheduler.from_config(self.noise_scheduler.config)
+        sampler.set_timesteps(num_inference_steps)
+
+        # 3) Denoising loop with (optional) classifier-free guidance
+        for t in sampler.timesteps:
+            ts = torch.full((N,), t, device=device, dtype=torch.long)
+
+            if labels is not None:
+                e_uncond = self.unet(latents, ts, y=None)
+                e_cond   = self.unet(latents, ts, y=labels)
+                eps = e_uncond + guidance_scale * (e_cond - e_uncond)
+            else:
+                eps = self.unet(latents, ts, y=None)
+
+            # All tensors here are float32, matching the scheduler’s buffers
+            latents = sampler.step(eps, t, latents).prev_sample
+
+        return latents
+
