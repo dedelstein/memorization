@@ -110,82 +110,65 @@ class ClassifierFreeGuidedDiffusion(pl.LightningModule):
         return torch.randn((batch_size, channels, height, width), device=device)
 
     def training_step(self, batch, batch_idx):
-        """
-        Compute the training loss with conditional guidance and sample filtering by a threshold tau.
-
-        The threshold tau is taken from hyperparameters (self.hparams.tau). Samples whose guidance signal magnitude
-        exceeds tau are excluded from the loss to mitigate overly confident conditional predictions.
-
-        Args:
-            batch: Tuple of (images, labels)
-            batch_idx: Index of the current batch
-        Returns:
-            loss tensor
-        """
         images, labels = batch
         images = images.to(self.device)
         labels = labels.to(self.device)
-
-        # Initialize latent and noise
+        
+        # Setup noise
         latents = images
         noise = torch.randn_like(latents)
-
-        # Sample random timesteps
-        bsz = latents.size(0)
+        bsz = latents.shape[0]
         timesteps = torch.randint(
             0,
             self.noise_scheduler.config.num_train_timesteps,
             (bsz,),
             device=self.device,
         ).long()
-
-        # Add noise at sampled timesteps
+        
+        # Add noise
         noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
 
-        # Classifier-free guidance dropout
+        # First get unconditional prediction
+        noise_pred_uncond = self.unet(noisy_latents, timesteps, y=None)
+        
+        # Then get conditional prediction with dropout
+        cond_labels = labels
         if self.training and self.hparams.conditioning_dropout_prob > 0:
             keep = torch.bernoulli(
                 torch.full((bsz,), 1 - self.hparams.conditioning_dropout_prob, device=self.device)
             )
-            cond_labels = labels * keep.unsqueeze(1)
-        else:
-            cond_labels = labels
-
-        # Predict noise with and without conditioning
+            cond_labels = cond_labels * keep.unsqueeze(1)
+        
         noise_pred_cond = self.unet(noisy_latents, timesteps, y=cond_labels)
-        noise_pred_uncond = self.unet(noisy_latents, timesteps, y=None)
-
-        # Compute guidance magnitude per sample
-        # Flatten spatial dims and compute L2 norm
+        
+        # Compute guidance magnitude
         magnitude_diff = torch.norm(
             (noise_pred_cond - noise_pred_uncond).view(bsz, -1),
             dim=1
         )
-
-        # Retrieve tau threshold from hyperparameters
+        
+        # Get tau threshold from hyperparameters
         tau = getattr(self.hparams, 'tau', 1.0)
-
-        # Select samples where magnitude is below threshold
+        
+        # Filter samples where guidance is too strong
         valid_mask = magnitude_diff <= tau
-
+        
+        # Log percentage of filtered samples
+        percent_filtered = (1.0 - valid_mask.float().mean()) * 100
+        self.log("percent_filtered", percent_filtered, prog_bar=True)
+        
         if not valid_mask.any():
-            # If no valid samples, return a zero loss to maintain graph
-            zero_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
-            self.log("train_loss", zero_loss, prog_bar=True)
-            return zero_loss
-
-        # Compute MSE loss only over valid samples
-        loss = F.mse_loss(
-            noise_pred_cond[valid_mask],
-            noise[valid_mask]
-        )
-
-        # Log training loss
+            # If all samples filtered, return zero loss
+            return torch.tensor(0.0, device=self.device, requires_grad=True)
+        
+        # Compute loss only on valid samples
+        loss = F.mse_loss(noise_pred_cond[valid_mask], noise[valid_mask])
+        
         self.log("train_loss", loss, prog_bar=True)
-
-        # Increment internal step counter
+        self.log("guidance_magnitude_mean", magnitude_diff.mean(), prog_bar=True)
+        self.log("guidance_magnitude_max", magnitude_diff.max(), prog_bar=True)
+        
         self._step_counter += 1
-
         return loss
 
     def on_after_backward(self):

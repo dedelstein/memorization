@@ -311,6 +311,13 @@ def main():
         help="Number of batches to accumulate gradients for",
     )
 
+    parser.add_argument(
+        "--tau",
+        type=float,
+        default=1.0,
+        help="Threshold for guidance magnitude filtering",
+    )
+
     args = parser.parse_args()
 
     # Create necessary directories
