@@ -4,8 +4,8 @@
 ###############################################################################
 
 ### -- Job information and resources --
-#BSUB -J DDPM_Training        # Job name
-#BSUB -q gpuv100             # GPU queue for V100s
+#BSUB -J DDPM_Training_128        # Job name
+#BSUB -q gpua100             # GPU queue for V100s
 #BSUB -n 8                   # Number of cores
 #BSUB -gpu "num=1:mode=exclusive_process"  # Request 1 GPU in exclusive mode
 #BSUB -R "span[hosts=1]"     # All cores on same host
@@ -40,14 +40,7 @@ echo "Setting up environment..."
 module load pandas/2.1.3-python-3.10.13
 module list  # List loaded modules for debugging
 
-# Initialize Conda 
-source /zhome/5c/6/219415/miniconda3/etc/profile.d/conda.sh
-
-# Activate conda environment (replace 'venv' with your actual environment name)
-echo "Activating Conda environment..."
-conda activate memorization
-echo "Python version: $(python --version)"
-echo "Conda version: $(conda --version)"
+source /zhome/91/9/214141/default_venv/bin/activate
 
 # Check GPU before running
 if command -v nvidia-smi &> /dev/null; then
@@ -64,7 +57,7 @@ echo "Starting training at $(date)"
 echo "Command: python3 train_cfg_diffusion.py --batch_size 4"
 
 # Run training
-python3 train_cfg_diffusion.py --batch_size 8 --img_size 64 --debug_mode
+python3 train_cfg_diffusion.py --batch_size 6 --img_size 128 
 
 ### -- Job cleanup and information --
 echo "Training finished at $(date)"
@@ -84,7 +77,5 @@ fi
     echo "============================"
 } > "logs/job_report_${LSB_JOBID}.txt"
 
-# Deactivate the conda environment
-conda deactivate
 
 echo "Job completed"
