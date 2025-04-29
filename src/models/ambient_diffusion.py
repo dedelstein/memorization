@@ -2,7 +2,7 @@ import os
 import math
 import random
 from collections import deque
-from typing import Optional
+from typing import Optional, List
 
 import pytorch_lightning as pl
 import torch
@@ -59,6 +59,7 @@ class AmbientDiffusion(pl.LightningModule):
             beta_schedule=noise_scheduler_beta_schedule,
             num_train_timesteps=noise_scheduler_num_train_timesteps,
         )
+        self.register_buffer('betas', self.noise_scheduler.betas.clone())
 
         # EMA settings
         self.use_ema = use_ema
@@ -93,7 +94,7 @@ class AmbientDiffusion(pl.LightningModule):
 
     def _get_ambient_score_matching_loss(self, x_tn_samples, t, noise, cond):
         # compute coefficients
-        sigma_t = self.noise_scheduler.betas[t].sqrt().view(-1,1,1,1)
+        sigma_t = self.betas[t].sqrt().view(-1,1,1,1)
         sigma_n = self.sigma_t_nature
         alpha_t = (1 - sigma_t**2).sqrt()
         alpha_n = math.sqrt(1 - sigma_n**2)
@@ -208,39 +209,93 @@ class AmbientDiffusion(pl.LightningModule):
 
     def generate_samples(
         self,
-        batch_size=4,
-        labels=None,
-        guidance_scale=3.0,
-        num_inference_steps=50,
-        return_all_timesteps=False,
+        batch_size: int = 4,
+        labels: Optional[torch.Tensor] = None,
+        guidance_scale: float = 3.0,
+        num_inference_steps: int = 50,
+        return_all_timesteps: bool = False,
+        initial_noise: Optional[torch.Tensor] = None,
     ):
-        model = self._get_model_for_evaluation()
-        model.eval()
-        ddim = DDIMScheduler.from_config(self.noise_scheduler.config)
-        ddim.set_timesteps(num_inference_steps)
-        latents = self.prepare_latents(batch_size, model.in_channels, model.image_size, model.image_size)
-        if labels is None:
-            labels = torch.zeros((batch_size, len(CHEXPERT_CLASSES)), device=self.device)
-            labels[:, CHEXPERT_CLASSES.index('No Finding')] = 1.0
+        """Generate samples with detailed debugging."""
+        device = self.device
+        model = self._get_model_for_evaluation().eval()
+        
+        # Build scheduler
+        scheduler = DDIMScheduler.from_config(self.noise_scheduler.config)
+        scheduler.set_timesteps(num_inference_steps)
+
+        # Handle labels
+        if labels is not None:
+            if not torch.is_tensor(labels):
+                labels = torch.tensor(labels, device=device)
+            elif labels.dim() == 0:
+                idx = int(labels)
+                labels = torch.zeros(batch_size, len(CHEXPERT_CLASSES), device=device)
+                labels[:, idx] = 1.0
+        else:
+            labels = torch.zeros(batch_size, len(CHEXPERT_CLASSES), device=device)
+            labels[:, CHEXPERT_CLASSES.index("No Finding")] = 1.0
+
+        # Handle latents
+        if initial_noise is not None:
+            latents = initial_noise.to(device)
+        else:
+            latents = self.prepare_latents(
+                batch_size, model.in_channels, model.image_size, model.image_size, device
+            )
+
+        # Handle classifier-free guidance
         if guidance_scale > 1.0:
             uncond = torch.zeros_like(labels)
             cat_labels = torch.cat([uncond, labels], dim=0)
             latents = torch.cat([latents, latents], dim=0)
         else:
             cat_labels = labels
-        imgs_all = []
+
+        # Denoising loop
+        all_latents = []
         with torch.no_grad():
-            for t in ddim.timesteps:
-                if guidance_scale > 1.0:
-                    preds = model(latents, t, y=cat_labels).chunk(2)
-                    noise_pred = preds[0] + guidance_scale * (preds[1] - preds[0])
-                else:
-                    noise_pred = model(latents, t, y=labels)
-                latents = ddim.step(noise_pred, t, latents).prev_sample
+            for t in scheduler.timesteps:
+                
+                # Convert timestep to tensor with correct shape
+                timesteps = torch.full(
+                    (latents.shape[0],), t, device=device, dtype=torch.long
+                )
+                
+                try:
+                    # Model forward pass
+                    model_output = model(latents, timesteps, y=cat_labels)
+                    
+                    if guidance_scale > 1.0:
+                        noise_pred_uncond, noise_pred_cond = model_output.chunk(2)
+                        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+                    else:
+                        noise_pred = model_output
+                    
+                    # Scheduler step
+                    scheduler_out = scheduler.step(noise_pred, t, latents)
+                    latents = scheduler_out.prev_sample
+                    
+                except Exception as e:
+                    print(f"[DEBUG] Error during model forward pass or scheduler step:")
+                    print(f"Error type: {type(e)}")
+                    print(f"Error message: {str(e)}")
+                    import traceback
+                    print(f"Traceback:\n{''.join(traceback.format_tb(e.__traceback__))}")
+                    raise
+
                 if return_all_timesteps:
-                    imgs_all.append(self.denormalize_latents(latents[:batch_size] if guidance_scale>1.0 else latents))
-        final = latents[:batch_size] if guidance_scale>1.0 else latents
-        return (self.denormalize_latents(final), imgs_all) if return_all_timesteps else self.denormalize_latents(final)
+                    all_latents.append(latents[:batch_size].clone())
+
+        # Final output processing
+        final_latents = latents[:batch_size]
+        images = self.denormalize_latents(final_latents)
+
+        if return_all_timesteps:
+            all_images = [self.denormalize_latents(x) for x in all_latents]
+            return images, all_images
+
+        return images
 
     def denormalize_latents(self, latents):
         imgs = (latents * 0.5 + 0.5).clamp(0,1)

@@ -1,31 +1,30 @@
 #!/bin/sh 
 ### General options 
 ### -- specify queue -- 
-#BSUB -q gpuv100
-### -- set the job Name -- 
-#BSUB -J AmbientDiffusion
-### -- ask for number of cores (default: 1) -- 
-#BSUB -n 4 
-#BSUB -gpu "num=1:mode=exclusive_process"
-### -- specify that the cores must be on the same host -- 
-#BSUB -R "span[hosts=1]"
-### -- specify that we need 4GB of memory per core/slot -- 
-#BSUB -R "rusage[mem=4GB]"
-### -- specify that we want the job to get killed if it exceeds 5 GB per core/slot -- 
-#BSUB -M 5GB
-### -- set walltime limit: hh:mm -- 
-#BSUB -W 4:00 
-### -- send notification at start -- 
-#BSUB -B 
-### -- send notification at completion -- 
-#BSUB -N 
-### -- Specify the output and error file. %J is the job-id -- 
-### -- -o and -e mean append, -oo and -eo mean overwrite -- 
-#BSUB -o Output_ambient_%J.out 
+#BSUB -J DDPM_Training_128_v_ambient # Job name
+#BSUB -q gpuv100             # GPU queue for V100s
+#BSUB -n 4                   # Number of cores
+#BSUB -gpu "num=1:mode=exclusive_process"  # Request 1 GPU in exclusive mode
+#BSUB -R "span[hosts=1]"     # All cores on same host
+#BSUB -R "rusage[mem=8GB]"   # 4GB RAM per core
+#BSUB -R "select[gpu32gb]"   # 32 GB GPU
+#BSUB -M 9GB                 # Memory limit per core
+#BSUB -W 24:00                # Walltime limit (hours:minutes)
+
+### -- Notification options --
+#BSUB -B                     # Notify at job start
+#BSUB -N                     # Notify at job completion
+##BSUB -u your_email_address # Uncomment and change to your email for notifications
+
+### -- Output options --
+#BSUB -o logs/DDPM_ambient_%J.out    # Standard output log
+#BSUB -e logs/DDPM_ambient_%J.err    # Error log
 #BSUB -e Output_ambient_%J.err 
 
-module load pandas/2.1.3-python-3.10.13
+source /zhome/91/9/214141/default_venv/bin/activate
 
-source venv/bin/activate
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# Set any other environment variables
+export CUDA_VISIBLE_DEVICES=0
 
-python3 train_ambient_diffusion.py --batch_size 16 --ambient_t_nature 0.5 --epochs 100 > joboutput_ambient_$LSB_JOBID.out 2>&1
+python3 train_ambient_diffusion.py --batch_size 4 --ambient_t_nature 0.5 --epochs 40 --img_size=128
