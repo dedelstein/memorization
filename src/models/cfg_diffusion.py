@@ -110,13 +110,28 @@ class ClassifierFreeGuidedDiffusion(pl.LightningModule):
         return torch.randn((batch_size, channels, height, width), device=device)
 
     def training_step(self, batch, batch_idx):
+        """
+        Compute the training loss with conditional guidance and sample filtering by a threshold tau.
+
+        The threshold tau is taken from hyperparameters (self.hparams.tau). Samples whose guidance signal magnitude
+        exceeds tau are excluded from the loss to mitigate overly confident conditional predictions.
+
+        Args:
+            batch: Tuple of (images, labels)
+            batch_idx: Index of the current batch
+        Returns:
+            loss tensor
+        """
         images, labels = batch
         images = images.to(self.device)
         labels = labels.to(self.device)
 
+        # Initialize latent and noise
         latents = images
         noise = torch.randn_like(latents)
-        bsz = latents.shape[0]
+
+        # Sample random timesteps
+        bsz = latents.size(0)
         timesteps = torch.randint(
             0,
             self.noise_scheduler.config.num_train_timesteps,
@@ -124,21 +139,53 @@ class ClassifierFreeGuidedDiffusion(pl.LightningModule):
             device=self.device,
         ).long()
 
+        # Add noise at sampled timesteps
         noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
 
-        # Changed: classifier-free guidance on multi-hot labels
-        cond_labels = labels
+        # Classifier-free guidance dropout
         if self.training and self.hparams.conditioning_dropout_prob > 0:
             keep = torch.bernoulli(
                 torch.full((bsz,), 1 - self.hparams.conditioning_dropout_prob, device=self.device)
             )
-            cond_labels = cond_labels * keep.unsqueeze(1)
+            cond_labels = labels * keep.unsqueeze(1)
+        else:
+            cond_labels = labels
 
-        noise_pred = self.unet(noisy_latents, timesteps, y=cond_labels)
-        loss = F.mse_loss(noise_pred, noise)
+        # Predict noise with and without conditioning
+        noise_pred_cond = self.unet(noisy_latents, timesteps, y=cond_labels)
+        noise_pred_uncond = self.unet(noisy_latents, timesteps, y=None)
+
+        # Compute guidance magnitude per sample
+        # Flatten spatial dims and compute L2 norm
+        magnitude_diff = torch.norm(
+            (noise_pred_cond - noise_pred_uncond).view(bsz, -1),
+            dim=1
+        )
+
+        # Retrieve tau threshold from hyperparameters
+        tau = getattr(self.hparams, 'tau', 1.0)
+
+        # Select samples where magnitude is below threshold
+        valid_mask = magnitude_diff <= tau
+
+        if not valid_mask.any():
+            # If no valid samples, return a zero loss to maintain graph
+            zero_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+            self.log("train_loss", zero_loss, prog_bar=True)
+            return zero_loss
+
+        # Compute MSE loss only over valid samples
+        loss = F.mse_loss(
+            noise_pred_cond[valid_mask],
+            noise[valid_mask]
+        )
+
+        # Log training loss
         self.log("train_loss", loss, prog_bar=True)
 
+        # Increment internal step counter
         self._step_counter += 1
+
         return loss
 
     def on_after_backward(self):
