@@ -146,7 +146,7 @@ def train_cfg_diffusion(args):
         max_epochs=args.epochs,
         accelerator="auto",  # This will automatically detect the available hardware
         devices=1,
-        precision=precision,
+        precision="32",
         logger=loggers,
         callbacks=callbacks,
         log_every_n_steps=50,
@@ -177,6 +177,7 @@ def main():
 
     # Model parameters
     parser.add_argument("--img_size", type=int, default=192, help="Image size")
+
     parser.add_argument(
         "--pretrained_model_path",
         type=str,
