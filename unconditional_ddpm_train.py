@@ -575,7 +575,7 @@ def main(args):
     )
 
     # Initialize the CheXpert DataModule
-    datamodule = CheXpertDiffusionDataModule(
+    datamodule = CheXpertDataModule(
         data_dir=args.data_dir,
         img_size=args.resolution,
         batch_size=args.train_batch_size,

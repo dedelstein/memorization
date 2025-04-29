@@ -11,6 +11,8 @@ import torchvision.io as io
 from torch.utils.data import DataLoader, Dataset, random_split
 from torchvision import transforms
 
+from src.utils.constants import CHEXPERT_CLASSES
+
 
 class CheXpertDataset(Dataset):
     """
@@ -35,120 +37,60 @@ class CheXpertDataset(Dataset):
             class_index: Which classes to use (defaults to all 14).
             img_size: Size for image resizing.
         """
+        # Configure class indices
+        if class_index is None:
+            self.class_index = list(range(len(CHEXPERT_CLASSES)))
+        else:
+            self.class_index = class_index
 
-        # Define findings (labels) list
-        self.findings = [
-            "No Finding",
-            "Enlarged Cardiomediastinum",
-            "Cardiomegaly",
-            "Lung Opacity",
-            "Lung Lesion",
-            "Edema",
-            "Consolidation",
-            "Pneumonia",
-            "Atelectasis",
-            "Pneumothorax",
-            "Pleural Effusion",
-            "Pleural Other",
-            "Fracture",
-            "Support Devices",
-        ]
+        self.classes = [CHEXPERT_CLASSES[i] for i in self.class_index]
 
         # Load and filter data
         df = pd.read_csv(csv_file)
 
-        # Filter for frontal images with AP projection
-        filtered_df = df[(df["Frontal/Lateral"] == "Frontal") & (df["AP/PA"] == "AP")]
-
-        # Fill NA values and convert -1.0 to 0.0
-        filtered_df = filtered_df.fillna(0.0).replace(-1.0, 0.0)
-
-        # Select only necessary columns
-        filtered_df = filtered_df[["Path"] + self.findings]
-
-        self.data_frame = filtered_df
-
-        # Debug mode to use a small subset
-        if debug_mode:
-            self.data_frame = self.data_frame.iloc[: min(10000, len(self.data_frame))]
-
-        # Balance the dataset
-        self.data_frame = self._balance_dataset(
-            self.data_frame,
-            min_ratio=0.05,
-            max_samples_per_class=1000,
+        # Preprocess dataset
+        self.data_frame = self._preprocess_dataset(
+            df,
+            debug_mode=debug_mode,
         )
 
         # Set up class variables
-        self.base_dir = base_dir
+        self.base_dir = base_dir[: -len("CheXpert-v1.0-small")]
         self.transform = transform
         self.img_size = img_size
 
-        # Configure class indices
-        if class_index is None:
-            self.class_index = list(range(len(self.findings)))
-        else:
-            self.class_index = class_index
-
-        self.classes = [self.findings[i] for i in self.class_index]
-
-    def _balance_dataset(self, df, min_ratio=0.05, max_samples_per_class=None):
+    def _preprocess_dataset(
+        self, df, filter_frontal_ap=True, fill_na=True, debug_mode=False
+    ):
         """
-        Balances the dataset to improve the representation of minority classes.
+        Preprocess the CheXpert dataset.
 
         Args:
-            df: Original DataFrame
-            min_ratio: Minimum desired ratio for each class
-            max_samples_per_class: Maximum number of samples per class
+            df: Input DataFrame
+            filter_frontal_ap: Whether to filter for frontal AP images
+            fill_na: Whether to fill NA values with 0
+            debug_mode: Whether to use a small subset for debugging
 
         Returns:
-            Balanced DataFrame
+            Processed DataFrame
         """
-        # Initialize a set for selected indices
-        selected_indices = set()
+        if filter_frontal_ap:
+            # Filter for frontal images with AP projection
+            df = df[(df["Frontal/Lateral"] == "Frontal") & (df["AP/PA"] == "AP")]
 
-        # For each medical finding, select samples in a balanced manner
-        for finding in self.findings:
-            positive_samples = df[df[finding] == 1]
-            negative_samples = df[df[finding] == 0]
+        if fill_na:
+            # Fill NA values and convert -1.0 to 0.0
+            df = df.fillna(0.0).replace(-1.0, 0.0)
 
-            # Determine the number of samples to select
-            positive_count = len(positive_samples)
+        # Select only necessary columns
+        filtered_df = df[["Path"] + self.classes]
 
-            # If there are very few positive samples, take all of them
-            if positive_count < 100:
-                sample_size = positive_count
-            else:
-                # Define a sample size based on the minimum desired ratio
-                # and limited by max_samples_per_class if specified
-                sample_size = min(
-                    positive_count,
-                    int(len(df) * min_ratio),
-                    max_samples_per_class if max_samples_per_class else float("inf"),
-                )
+        # Debug mode to use a small subset
+        if debug_mode:
+            filtered_df = filtered_df.iloc[: min(1000, len(filtered_df))]
 
-            # Take a random balanced sample
-            if sample_size < positive_count:
-                pos_indices = positive_samples.sample(sample_size).index.tolist()
-            else:
-                pos_indices = positive_samples.index.tolist()
-
-            neg_indices = negative_samples.sample(
-                min(sample_size * 2, len(negative_samples))
-            ).index.tolist()
-
-            # Add the selected indices to the set
-            selected_indices.update(pos_indices)
-            selected_indices.update(neg_indices)
-
-        # Create a new DataFrame with the selected indices
-        balanced_df = df.loc[list(selected_indices)]
-
-        # Show the size of the original and balanced datasets
-        print(f"Original dataset size: {len(df)}")
-        print(f"Balanced dataset size: {len(balanced_df)}")
-
-        return balanced_df
+        # Return the processed dataframe
+        return filtered_df
 
     def __len__(self):
         return len(self.data_frame)
@@ -158,10 +100,15 @@ class CheXpertDataset(Dataset):
         Get a sample from the dataset, optimized for performance.
         """
         # Get image path
-        img_path = self.data_frame.iloc[idx]["Path"]
+        img_path = os.path.join(self.base_dir, self.data_frame.iloc[idx]["Path"])
 
-        # Read the image using torchvision
-        image = io.read_image(img_path, mode=io.ImageReadMode.GRAY)
+        try:
+            # Read the image using torchvision
+            image = io.read_image(img_path, mode=io.ImageReadMode.GRAY)
+        except Exception as e:
+            print(f"Error reading image {img_path}: {e}")
+            # Return a default black image if reading fails
+            image = torch.zeros(1, self.img_size, self.img_size)
 
         # Convert to float and normalize
         image = image.float() / 255.0
@@ -178,19 +125,15 @@ class CheXpertDataset(Dataset):
         # Normalize to [-1, 1]
         image = image * 2.0 - 1.0
 
-        # Get labels - Fix for numpy.object_ error
-        # First, try direct tensor conversion
-        labels = torch.tensor(
-            self.data_frame.iloc[idx][self.classes].values, dtype=torch.float32
-        )
-        # except TypeError:
-        #     # If that fails, manually convert each value to float
-        #     label_values = self.data_frame.iloc[idx][self.classes].values
-        #     labels = torch.tensor(
-        #         [float(val) for val in label_values], dtype=torch.float32
-        #     )
+        # Apply transforms if available
+        if self.transform:
+            image = self.transform(image)
 
-        
+        # Get labels as tensor from npy array
+        labels = torch.tensor(
+            self.data_frame.iloc[idx][self.classes].values.astype(float),
+            dtype=torch.float32,
+        )
 
         return {"image": image, "labels": labels}  # Return as dict for compatibility
 
