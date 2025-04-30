@@ -30,9 +30,9 @@ def _extract_into_tensor(arr, timesteps, broadcast_shape):
 
 
 
-
+"""
 def set_seed(seed=42):
-    """Set random seed for reproducibility."""
+    #Set random seed for reproducibility.
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -40,7 +40,20 @@ def set_seed(seed=42):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-
+"""
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    # Check if running on TPU
+    if hasattr(torch, 'xla'):
+        import torch_xla.core.xla_model as xm
+        xm.set_rng_state(seed)
+    else:
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 def normalize_image(img):
     """Normalize image to range [0, 1]."""

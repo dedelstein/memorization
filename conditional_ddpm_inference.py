@@ -6,6 +6,7 @@ from PIL import Image
 import matplotlib.pyplot as plt
 from diffusers import DDPMScheduler
 from src.utils.constants import CHEXPERT_CLASSES
+import torch_xla.core.xla_model as xm
 
 def parse_args():
     parser = argparse.ArgumentParser(description="CheXpert DDPM Inference Script")
@@ -109,7 +110,9 @@ def load_model(model_path):
         )
         
         # Mover a GPU si está disponible
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        #device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # TPU change
+        device = xm.xla_device()
         pipeline = pipeline.to(device)
         
         print("Model loaded successfully")
@@ -197,7 +200,9 @@ def generate_images(pipeline, class_labels, condition_names, num_images, num_inf
     generated_images = {}
     
     # Set the seed for reproducibility
-    generator = torch.Generator(device=pipeline.device).manual_seed(seed)
+    #generator = torch.Generator(device=pipeline.device).manual_seed(seed)
+    #TPU change
+    generator = torch.Generator().manual_seed(seed)
     
     for i, condition_name in enumerate(condition_names):
         print(f"Generating images for condition: {condition_name}")

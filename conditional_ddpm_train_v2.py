@@ -23,12 +23,17 @@ from packaging import version
 from PIL import Image
 from tqdm.auto import tqdm
 
+import torch_xla.core.xla_model as xm
+import torch_xla.distributed.parallel_loader as pl
+import torch_xla.distributed.xla_multiprocessing as xmp
+
 from src.data.chexpert_datamodule import CheXpertDataModule
 from src.models.cfg_diffusion import CustomClassConditionedUnet
 from src.utils.helpers import _extract_into_tensor
 from src.utils.constants import CHEXPERT_CLASSES
 from src.models.conditional_ddpm_pipeline import ConditionalDDPMPipeline
 logger = get_logger(__name__, log_level="INFO")
+
 
 
 
@@ -260,6 +265,14 @@ def parse_args():
         "--seed", type=int, default=42, help="Random seed for initialization"
     )
 
+    parser.add_argument(
+        "--tau", type=float, default=3.0, help="Tau value for dememorization"
+    )
+
+    parser.add_argument(
+        "--ambient_diff_tau", type=float, default=1.0, help="Tau value for ambient diffusion"
+    )
+
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
@@ -277,12 +290,24 @@ def main(args):
     kwargs = InitProcessGroupKwargs(
         timeout=timedelta(seconds=7200)
     )  # a big number for high resolution or big dataset
+    """
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with=args.logger,
         project_config=accelerator_project_config,
         kwargs_handlers=[kwargs],
+    )
+    """
+    # TPU specific settings
+    accelerator = Accelerator(
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        mixed_precision="bf16",  # Use bf16 for TPU
+        log_with=args.logger,
+        project_config=accelerator_project_config,
+        kwargs_handlers=[kwargs],
+        device="xla",  # Add this line
+        cpu=False      # Add this line
     )
 
     if not is_tensorboard_available():
@@ -433,6 +458,10 @@ def main(args):
     train_dataloader = datamodule.train_dataloader()
     val_dataloader = datamodule.val_dataloader()
 
+    # TPU specific settings
+    train_dataloader = pl.ParallelLoader(train_dataloader, [xm.xla_device()]).per_device_loader(xm.xla_device())
+    val_dataloader = pl.ParallelLoader(val_dataloader, [xm.xla_device()]).per_device_loader(xm.xla_device())
+
     # Initialize the learning rate scheduler
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
@@ -546,6 +575,8 @@ def main(args):
                 conditional_input[~use_conditioning_mask]
             )
 
+            tau = getattr(args, "tau", 1.0)
+
             # Sample noise that we'll add to the images
             noise = torch.randn(
                 clean_images.shape, dtype=weight_dtype, device=clean_images.device
@@ -565,38 +596,57 @@ def main(args):
             noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
 
             with accelerator.accumulate(model):
-                # Predict the noise residual
-                model_output = model(
+                # Compute conditional predictions
+                cond_output = model(
                     sample=noisy_images,
                     timestep=timesteps,
-                    class_labels=conditional_input,
+                    class_labels=class_labels,  # conditional (unmasked labels)
                 ).sample
 
-                if args.prediction_type == "epsilon":
-                    loss = F.mse_loss(
-                        model_output.float(), noise.float()
-                    )  # this could have different weights!
+                # Compute unconditional predictions
+                uncond_labels = torch.zeros_like(class_labels)
+                uncond_output = model(
+                    sample=noisy_images,
+                    timestep=timesteps,
+                    class_labels=uncond_labels,  # unconditional (zeros labels)
+                ).sample
 
-                elif args.prediction_type == "sample":
-                    alpha_t = _extract_into_tensor(
-                        noise_scheduler.alphas_cumprod,
-                        timesteps,
-                        (clean_images.shape[0], 1, 1, 1),
-                    )
-                    snr_weights = alpha_t / (1 - alpha_t)
-                    # use SNR weighting from distillation paper
-                    loss = snr_weights * F.mse_loss(
-                        model_output.float(), clean_images.float(), reduction="none"
-                    )
-                    loss = loss.mean()
+                # Calculate magnitude difference
+                magnitude_diff = torch.norm(cond_output - uncond_output, dim=[1, 2, 3])
+
+                # Apply tau threshold from args
+                tau = getattr(args, "tau", 1.0)
+                valid_mask = magnitude_diff <= tau
+
+                # Log the percentage of filtered samples
+                percent_filtered = (1.0 - valid_mask.float().mean()) * 100
+                accelerator.log({"percent_filtered": percent_filtered.item()}, step=global_step)
+
+                if not valid_mask.any():
+                    # If all samples filtered, set zero loss
+                    loss = torch.tensor(0.0, device=clean_images.device, requires_grad=True)
                 else:
-                    raise ValueError(
-                        f"Unsupported prediction type: {args.prediction_type}"
-                    )
-
+                    # Compute loss only on valid samples
+                    if args.prediction_type == "epsilon":
+                        loss = F.mse_loss(cond_output[valid_mask].float(), noise[valid_mask].float())
+                    elif args.prediction_type == "sample":
+                        alpha_t = _extract_into_tensor(
+                            noise_scheduler.alphas_cumprod,
+                            timesteps,
+                            (clean_images.shape[0], 1, 1, 1),
+                        )
+                        snr_weights = alpha_t / (1 - alpha_t)
+                        loss = snr_weights[valid_mask] * F.mse_loss(
+                            cond_output[valid_mask].float(), clean_images[valid_mask].float(), reduction="none"
+                        )
+                        loss = loss.mean()
+                    else:
+                        raise ValueError(f"Unsupported prediction type: {args.prediction_type}")
+                    
                 accelerator.backward(loss)
 
                 if accelerator.sync_gradients:
+                    xm.reduce_gradients(optimizer)
                     accelerator.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
                 lr_scheduler.step()
@@ -640,7 +690,8 @@ def main(args):
                                         args.output_dir, removing_checkpoint
                                     )
                                     shutil.rmtree(removing_checkpoint)
-
+                                    
+                        xm.mark_step()
                         save_path = os.path.join(
                             args.output_dir, f"checkpoint-{global_step}"
                         )
@@ -679,7 +730,8 @@ def main(args):
                     scheduler=noise_scheduler,
                 )
 
-                generator = torch.Generator(device=pipeline.device).manual_seed(0)
+                #generator = torch.Generator(device=pipeline.device).manual_seed(0)
+                generator = torch.Generator().manual_seed(0)
 
                 # Create labels for generation
                 class_labels = torch.zeros(
