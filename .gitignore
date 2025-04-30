@@ -5,10 +5,9 @@ CheXpert-v1.0-small/valid/*
 cft_classifier
 README_copy.md
 checkpoints/
-logs/
+chest_xray_diffusion/
 cft_classifier/
 progress_samples_*
-chest_xray_diffusion
 path_to_dataset.txt
 
 
