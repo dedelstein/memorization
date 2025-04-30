@@ -4,8 +4,6 @@ CheXpert-v1.0-small/train/*
 CheXpert-v1.0-small/valid/*
 cft_classifier
 README_copy.md
-checkpoints/
-chest_xray_diffusion/
 cft_classifier/
 progress_samples_*
 path_to_dataset.txt
