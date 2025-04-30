@@ -5,55 +5,33 @@ import math
 import os
 import shutil
 from datetime import timedelta
-from pathlib import Path
 
 import accelerate
+import diffusers
+import numpy as np
 import torch
 import torch.nn.functional as F
-import numpy as np
 from accelerate import Accelerator, InitProcessGroupKwargs
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration
-from packaging import version
-from tqdm.auto import tqdm
-
-import diffusers
-from diffusers import DDPMPipeline, DDPMScheduler, UNet2DModel, UNet2DConditionModel
+from diffusers import DDPMPipeline, DDPMScheduler, UNet2DModel
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
 from diffusers.utils import is_accelerate_version, is_tensorboard_available
 from diffusers.utils.import_utils import is_xformers_available
-import os
+from packaging import version
+from PIL import Image
+from tqdm.auto import tqdm
 
-import pandas as pd
-import pytorch_lightning as pl
-import torch
-import torch.nn as nn
-import torchvision.io as io
-from torch.utils.data import DataLoader, Dataset, random_split
 from src.data.chexpert_datamodule import CheXpertDataModule
+from src.models.cfg_diffusion import CustomClassConditionedUnet
+from src.utils.helpers import _extract_into_tensor
 from src.utils.constants import CHEXPERT_CLASSES
-
-
+from src.models.conditional_ddpm_pipeline import ConditionalDDPMPipeline
 logger = get_logger(__name__, log_level="INFO")
 
 
-def _extract_into_tensor(arr, timesteps, broadcast_shape):
-    """
-    Extract values from a 1-D numpy array for a batch of indices.
 
-    :param arr: the 1-D numpy array.
-    :param timesteps: a tensor of indices into the array to extract.
-    :param broadcast_shape: a larger shape of K dimensions with the batch
-                            dimension equal to the length of timesteps.
-    :return: a tensor of shape [batch_size, 1, ...] where the shape has K dims.
-    """
-    if not isinstance(arr, torch.Tensor):
-        arr = torch.from_numpy(arr)
-    res = arr[timesteps].float().to(timesteps.device)
-    while len(res.shape) < len(broadcast_shape):
-        res = res[..., None]
-    return res.expand(broadcast_shape)
 
 
 def parse_args():
@@ -87,10 +65,16 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--train_batch_size", type=int, default=16, help="Batch size (per device) for the training dataloader."
+        "--train_batch_size",
+        type=int,
+        default=16,
+        help="Batch size (per device) for the training dataloader.",
     )
     parser.add_argument(
-        "--eval_batch_size", type=int, default=2, help="The number of images to generate for evaluation."
+        "--eval_batch_size",
+        type=int,
+        default=16,
+        help="The number of images to generate for evaluation.",
     )
     parser.add_argument(
         "--dataloader_num_workers",
@@ -102,9 +86,17 @@ def parse_args():
         ),
     )
     parser.add_argument("--num_epochs", type=int, default=100)
-    parser.add_argument("--save_images_epochs", type=int, default=10, help="How often to save images during training.")
     parser.add_argument(
-        "--save_model_epochs", type=int, default=10, help="How often to save the model during training."
+        "--save_images_epochs",
+        type=int,
+        default=25,
+        help="How often to save images during training.",
+    )
+    parser.add_argument(
+        "--save_model_epochs",
+        type=int,
+        default=10,
+        help="How often to save the model during training.",
     )
     parser.add_argument(
         "--gradient_accumulation_steps",
@@ -128,29 +120,65 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--lr_warmup_steps", type=int, default=500, help="Number of steps for the warmup in the lr scheduler."
+        "--lr_warmup_steps",
+        type=int,
+        default=500,
+        help="Number of steps for the warmup in the lr scheduler.",
     )
-    parser.add_argument("--adam_beta1", type=float, default=0.95, help="The beta1 parameter for the Adam optimizer.")
-    parser.add_argument("--adam_beta2", type=float, default=0.999, help="The beta2 parameter for the Adam optimizer.")
     parser.add_argument(
-        "--adam_weight_decay", type=float, default=1e-6, help="Weight decay magnitude for the Adam optimizer."
+        "--adam_beta1",
+        type=float,
+        default=0.95,
+        help="The beta1 parameter for the Adam optimizer.",
     )
-    parser.add_argument("--adam_epsilon", type=float, default=1e-08, help="Epsilon value for the Adam optimizer.")
+    parser.add_argument(
+        "--adam_beta2",
+        type=float,
+        default=0.999,
+        help="The beta2 parameter for the Adam optimizer.",
+    )
+    parser.add_argument(
+        "--adam_weight_decay",
+        type=float,
+        default=1e-6,
+        help="Weight decay magnitude for the Adam optimizer.",
+    )
+    parser.add_argument(
+        "--adam_epsilon",
+        type=float,
+        default=1e-08,
+        help="Epsilon value for the Adam optimizer.",
+    )
     parser.add_argument(
         "--use_ema",
         action="store_true",
         help="Whether to use Exponential Moving Average for the final model weights.",
     )
-    parser.add_argument("--ema_inv_gamma", type=float, default=1.0, help="The inverse gamma value for the EMA decay.")
-    parser.add_argument("--ema_power", type=float, default=3 / 4, help="The power value for the EMA decay.")
-    parser.add_argument("--ema_max_decay", type=float, default=0.9999, help="The maximum decay magnitude for EMA.")
+    parser.add_argument(
+        "--ema_inv_gamma",
+        type=float,
+        default=1.0,
+        help="The inverse gamma value for the EMA decay.",
+    )
+    parser.add_argument(
+        "--ema_power",
+        type=float,
+        default=3 / 4,
+        help="The power value for the EMA decay.",
+    )
+    parser.add_argument(
+        "--ema_max_decay",
+        type=float,
+        default=0.9999,
+        help="The maximum decay magnitude for EMA.",
+    )
 
     parser.add_argument(
         "--logger",
         type=str,
         default="tensorboard",
         choices=["tensorboard", "neptune"],
-        help="Whether to use [tensorboard](https://www.tensorflow.org/tensorboard) for experiment tracking"
+        help="Whether to use [tensorboard](https://www.tensorflow.org/tensorboard) for experiment tracking",
     )
     parser.add_argument(
         "--logging_dir",
@@ -161,7 +189,12 @@ def parse_args():
             " *output_dir/runs/**CURRENT_DATETIME_HOSTNAME***."
         ),
     )
-    parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
+    parser.add_argument(
+        "--local_rank",
+        type=int,
+        default=-1,
+        help="For distributed training: local_rank",
+    )
     parser.add_argument(
         "--mixed_precision",
         type=str,
@@ -208,12 +241,24 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--enable_xformers_memory_efficient_attention", action="store_true", help="Whether or not to use xformers."
+        "--enable_xformers_memory_efficient_attention",
+        action="store_true",
+        help="Whether or not to use xformers.",
     )
     # Additional CheXpert-specific arguments
-    parser.add_argument("--debug_mode", action="store_true", help="Run in debug mode with a small subset of data")
-    parser.add_argument("--pin_memory", action="store_true", help="Use pin_memory for faster data transfer to GPU")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for initialization")
+    parser.add_argument(
+        "--debug_mode",
+        action="store_true",
+        help="Run in debug mode with a small subset of data",
+    )
+    parser.add_argument(
+        "--pin_memory",
+        action="store_true",
+        help="Use pin_memory for faster data transfer to GPU",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42, help="Random seed for initialization"
+    )
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -225,9 +270,13 @@ def parse_args():
 
 def main(args):
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
-    accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
+    accelerator_project_config = ProjectConfiguration(
+        project_dir=args.output_dir, logging_dir=logging_dir
+    )
 
-    kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=7200))  # a big number for high resolution or big dataset
+    kwargs = InitProcessGroupKwargs(
+        timeout=timedelta(seconds=7200)
+    )  # a big number for high resolution or big dataset
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
@@ -237,7 +286,9 @@ def main(args):
     )
 
     if not is_tensorboard_available():
-        raise ImportError("Make sure to install tensorboard if you want to use it for logging during training.")
+        raise ImportError(
+            "Make sure to install tensorboard if you want to use it for logging during training."
+        )
 
     # `accelerate` 0.16.0 will have better support for customized saving
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
@@ -245,17 +296,22 @@ def main(args):
         def save_model_hook(models, weights, output_dir):
             if accelerator.is_main_process:
                 if args.use_ema:
-                    ema_model.save_pretrained(os.path.join(output_dir, "unet_ema"))
+                    ema_model.save_pretrained(
+                        os.path.join(output_dir, "custom_unet_ema")
+                    )
 
                 for i, model in enumerate(models):
-                    model.save_pretrained(os.path.join(output_dir, "unet"))
+                    model.save_pretrained(os.path.join(output_dir, "custom_unet"))
 
                     # make sure to pop weight so that corresponding model is not saved again
                     weights.pop()
 
         def load_model_hook(models, input_dir):
             if args.use_ema:
-                load_model = EMAModel.from_pretrained(os.path.join(input_dir, "unet_ema"), UNet2DModel)
+                load_model = EMAModel.from_pretrained(
+                    os.path.join(input_dir, "custom_unet_ema"),
+                    CustomClassConditionedUnet,
+                )
                 ema_model.load_state_dict(load_model.state_dict())
                 ema_model.to(accelerator.device)
                 del load_model
@@ -265,7 +321,9 @@ def main(args):
                 model = models.pop()
 
                 # load diffusers style into model
-                load_model = UNet2DModel.from_pretrained(input_dir, subfolder="unet")
+                load_model = CustomClassConditionedUnet.from_pretrained(
+                    input_dir, subfolder="custom_unet"
+                )
                 model.register_to_config(**load_model.config)
 
                 model.load_state_dict(load_model.state_dict())
@@ -291,55 +349,9 @@ def main(args):
         if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
 
-    # Initialize the model for conditional generation with class labels
-    num_classes = len(CHEXPERT_CLASSES)  # 14 classes from CheXpert
-    # Fixed model initialization - using a fixed cross_attention_dim
-    cross_attention_dim = 32  # A smaller dimension suitable for class labels
-    
-    # Create a UNet2DConditionModel with proper class conditioning
-    model = UNet2DConditionModel(
+    # Initialize the model
+    model = CustomClassConditionedUnet(
         sample_size=args.resolution,
-        in_channels=1,              
-        out_channels=1,              
-        
-        down_block_types=("CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "DownBlock2D"),
-        mid_block_type="UNetMidBlock2DCrossAttn",
-        up_block_types=("UpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D"),
-        
-        block_out_channels=(128, 256, 512),
-        layers_per_block=2,
-        
-        norm_num_groups=16,
-        
-        cross_attention_dim=cross_attention_dim,  # Dimension for cross-attention
-        transformer_layers_per_block=1,
-        reverse_transformer_layers_per_block=None,
-        encoder_hid_dim=None,
-        encoder_hid_dim_type=None,
-        attention_head_dim=8,
-        num_attention_heads=None,
-        dual_cross_attention=False,
-        use_linear_projection=False,
-        class_embed_type="projection",  
-        addition_embed_type=None,
-        addition_time_embed_dim=None,
-        projection_class_embeddings_input_dim=num_classes,  # Dimension of multi-hot vector
-        upcast_attention=False,
-        resnet_time_scale_shift="default",
-        resnet_skip_time_act=False,
-        resnet_out_scale_factor=1,
-        time_embedding_type="positional",
-        time_embedding_dim=None,
-        time_embedding_act_fn=None,
-        timestep_post_act=None,
-        time_cond_proj_dim=None,
-        conv_in_kernel=3,
-        conv_out_kernel=3,
-        attention_type="default",
-        class_embeddings_concat=False,
-        mid_block_only_cross_attention=None,
-        cross_attention_norm=None,
-        addition_embed_type_num_heads=32
     )
 
     # Create EMA for the model.
@@ -350,7 +362,7 @@ def main(args):
             use_ema_warmup=True,
             inv_gamma=args.ema_inv_gamma,
             power=args.ema_power,
-            model_cls=UNet2DConditionModel,  # Updated to UNet2DConditionModel
+            model_cls=CustomClassConditionedUnet,
             model_config=model.config,
         )
 
@@ -373,10 +385,14 @@ def main(args):
                 )
             model.enable_xformers_memory_efficient_attention()
         else:
-            raise ValueError("xformers is not available. Make sure it is installed correctly")
+            raise ValueError(
+                "xformers is not available. Make sure it is installed correctly"
+            )
 
     # Initialize the scheduler
-    accepts_prediction_type = "prediction_type" in set(inspect.signature(DDPMScheduler.__init__).parameters.keys())
+    accepts_prediction_type = "prediction_type" in set(
+        inspect.signature(DDPMScheduler.__init__).parameters.keys()
+    )
     if accepts_prediction_type:
         noise_scheduler = DDPMScheduler(
             num_train_timesteps=args.ddpm_num_steps,
@@ -384,7 +400,10 @@ def main(args):
             prediction_type=args.prediction_type,
         )
     else:
-        noise_scheduler = DDPMScheduler(num_train_timesteps=args.ddpm_num_steps, beta_schedule=args.ddpm_beta_schedule)
+        noise_scheduler = DDPMScheduler(
+            num_train_timesteps=args.ddpm_num_steps,
+            beta_schedule=args.ddpm_beta_schedule,
+        )
 
     # Initialize the optimizer
     optimizer = torch.optim.AdamW(
@@ -405,11 +424,11 @@ def main(args):
         debug_mode=args.debug_mode,
         pin_memory=args.pin_memory,
     )
-    
+
     # Prepare the data
     datamodule.prepare_data()
     datamodule.setup(stage="fit")
-    
+
     # Get the dataloaders
     train_dataloader = datamodule.train_dataloader()
     val_dataloader = datamodule.val_dataloader()
@@ -423,8 +442,10 @@ def main(args):
     )
 
     # Prepare everything with our `accelerator`
-    model, optimizer, train_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader, val_dataloader, lr_scheduler
+    model, optimizer, train_dataloader, val_dataloader, lr_scheduler = (
+        accelerator.prepare(
+            model, optimizer, train_dataloader, val_dataloader, lr_scheduler
+        )
     )
 
     if args.use_ema:
@@ -436,15 +457,23 @@ def main(args):
         run = os.path.split(__file__)[-1].split(".")[0]
         accelerator.init_trackers(run)
 
-    total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    total_batch_size = (
+        args.train_batch_size
+        * accelerator.num_processes
+        * args.gradient_accumulation_steps
+    )
+    num_update_steps_per_epoch = math.ceil(
+        len(train_dataloader) / args.gradient_accumulation_steps
+    )
     max_train_steps = args.num_epochs * num_update_steps_per_epoch
 
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(datamodule.train_dataset)}")
     logger.info(f"  Num Epochs = {args.num_epochs}")
     logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
-    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
+    logger.info(
+        f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}"
+    )
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {max_train_steps}")
 
@@ -474,33 +503,61 @@ def main(args):
 
             resume_global_step = global_step * args.gradient_accumulation_steps
             first_epoch = global_step // num_update_steps_per_epoch
-            resume_step = resume_global_step % (num_update_steps_per_epoch * args.gradient_accumulation_steps)
+            resume_step = resume_global_step % (
+                num_update_steps_per_epoch * args.gradient_accumulation_steps
+            )
 
     # Train!
     for epoch in range(first_epoch, args.num_epochs):
         model.train()
-        progress_bar = tqdm(total=num_update_steps_per_epoch, disable=not accelerator.is_local_main_process)
+        progress_bar = tqdm(
+            total=num_update_steps_per_epoch,
+            disable=not accelerator.is_local_main_process,
+        )
         progress_bar.set_description(f"Epoch {epoch}")
-        
+
         for step, batch in enumerate(train_dataloader):
             # Skip steps until we reach the resumed step
-            if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
+            if (
+                args.resume_from_checkpoint
+                and epoch == first_epoch
+                and step < resume_step
+            ):
                 if step % args.gradient_accumulation_steps == 0:
                     progress_bar.update(1)
                 continue
 
-            # Adapt to the CheXpert dataset format (it returns a dict)
             clean_images = batch["image"].to(weight_dtype)
-            # Get class labels for conditioning 
-            class_labels = batch["labels"].to(accelerator.device)
-            
+            class_labels = batch["labels"].to(weight_dtype)
+
+            # For each batch, randomly drop some class labels
+            # to create a mix of conditional and unconditional samples
+            guidance_dropout_prob = 0.1
+            batch_size = clean_images.shape[0]
+
+            use_conditioning_mask = (
+                torch.rand(batch_size, device=clean_images.device)
+                >= guidance_dropout_prob
+            )
+
+            # Crear vector de condicionamiento donde algunas muestras tendrán etiquetas nulas
+            conditional_input = class_labels.clone()
+            conditional_input[~use_conditioning_mask] = torch.zeros_like(
+                conditional_input[~use_conditioning_mask]
+            )
+
             # Sample noise that we'll add to the images
-            noise = torch.randn(clean_images.shape, dtype=weight_dtype, device=clean_images.device)
+            noise = torch.randn(
+                clean_images.shape, dtype=weight_dtype, device=clean_images.device
+            )
             bsz = clean_images.shape[0]
-            
+
             # Sample a random timestep for each image
             timesteps = torch.randint(
-                0, noise_scheduler.config.num_train_timesteps, (bsz,), device=clean_images.device
+                0,
+                noise_scheduler.config.num_train_timesteps,
+                (bsz,),
+                device=clean_images.device,
             ).long()
 
             # Add noise to the clean images according to the noise magnitude at each timestep
@@ -508,34 +565,34 @@ def main(args):
             noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
 
             with accelerator.accumulate(model):
-                # Create a dummy tensor for encoder_hidden_states (required by the model)
-                # This allows us to use class conditioning without text conditioning
-                dummy_encoder_hidden_states = torch.zeros(
-                    (bsz, 1, cross_attention_dim), 
-                    device=clean_images.device, 
-                    dtype=weight_dtype
-                )
-                
-                # Predict the noise residual using the conditional model
+                # Predict the noise residual
                 model_output = model(
-                    noisy_images, 
-                    timesteps, 
-                    encoder_hidden_states=dummy_encoder_hidden_states,  # Provide dummy tensor
-                    class_labels=class_labels
+                    sample=noisy_images,
+                    timestep=timesteps,
+                    class_labels=conditional_input,
                 ).sample
 
                 if args.prediction_type == "epsilon":
-                    loss = F.mse_loss(model_output.float(), noise.float())
+                    loss = F.mse_loss(
+                        model_output.float(), noise.float()
+                    )  # this could have different weights!
+
                 elif args.prediction_type == "sample":
                     alpha_t = _extract_into_tensor(
-                        noise_scheduler.alphas_cumprod, timesteps, (clean_images.shape[0], 1, 1, 1)
+                        noise_scheduler.alphas_cumprod,
+                        timesteps,
+                        (clean_images.shape[0], 1, 1, 1),
                     )
                     snr_weights = alpha_t / (1 - alpha_t)
                     # use SNR weighting from distillation paper
-                    loss = snr_weights * F.mse_loss(model_output.float(), clean_images.float(), reduction="none")
+                    loss = snr_weights * F.mse_loss(
+                        model_output.float(), clean_images.float(), reduction="none"
+                    )
                     loss = loss.mean()
                 else:
-                    raise ValueError(f"Unsupported prediction type: {args.prediction_type}")
+                    raise ValueError(
+                        f"Unsupported prediction type: {args.prediction_type}"
+                    )
 
                 accelerator.backward(loss)
 
@@ -557,183 +614,154 @@ def main(args):
                         # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
                         if args.checkpoints_total_limit is not None:
                             checkpoints = os.listdir(args.output_dir)
-                            checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
-                            checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
+                            checkpoints = [
+                                d for d in checkpoints if d.startswith("checkpoint")
+                            ]
+                            checkpoints = sorted(
+                                checkpoints, key=lambda x: int(x.split("-")[1])
+                            )
 
                             # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
                             if len(checkpoints) >= args.checkpoints_total_limit:
-                                num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
+                                num_to_remove = (
+                                    len(checkpoints) - args.checkpoints_total_limit + 1
+                                )
                                 removing_checkpoints = checkpoints[0:num_to_remove]
 
                                 logger.info(
                                     f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
                                 )
-                                logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
+                                logger.info(
+                                    f"removing checkpoints: {', '.join(removing_checkpoints)}"
+                                )
 
                                 for removing_checkpoint in removing_checkpoints:
-                                    removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
+                                    removing_checkpoint = os.path.join(
+                                        args.output_dir, removing_checkpoint
+                                    )
                                     shutil.rmtree(removing_checkpoint)
 
-                        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                        save_path = os.path.join(
+                            args.output_dir, f"checkpoint-{global_step}"
+                        )
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
 
-            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "step": global_step}
+            logs = {
+                "loss": loss.detach().item(),
+                "lr": lr_scheduler.get_last_lr()[0],
+                "step": global_step,
+            }
             if args.use_ema:
                 logs["ema_decay"] = ema_model.cur_decay_value
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
-        
+
         progress_bar.close()
 
         accelerator.wait_for_everyone()
 
         # Generate sample images for visual inspection
         if accelerator.is_main_process:
-            if epoch % args.save_images_epochs == 0 or epoch == args.num_epochs - 1:
+            
+            if (epoch % args.save_images_epochs == 0) or epoch == args.num_epochs - 1:
+            
                 unet = accelerator.unwrap_model(model)
 
                 if args.use_ema:
                     ema_model.store(unet.parameters())
                     ema_model.copy_to(unet.parameters())
 
-                # Create a custom pipeline for conditional generation
-                class ConditionalDDPMPipeline(DDPMPipeline):
-                    def __call__(
-                        self, 
-                        batch_size=1, 
-                        generator=None, 
-                        num_inference_steps=1000, 
-                        output_type="pil", 
-                        class_labels=None,
-                        **kwargs
-                    ):
-                        # Generate random noise
-                        sample_shape = (batch_size, self.unet.config.in_channels, self.unet.config.sample_size, self.unet.config.sample_size)
-                        noise = torch.randn(sample_shape, generator=generator, device=self.device)
-                        
-                        # Set timesteps
-                        self.scheduler.set_timesteps(num_inference_steps)
-                        
-                        # Prepare class labels if provided
-                        if class_labels is None:
-                            # Default to all zeros (no condition) if no labels provided
-                            class_labels = torch.zeros(batch_size, len(CHEXPERT_CLASSES), device=self.device)
-                        
-                        # Create dummy encoder_hidden_states
-                        dummy_encoder_hidden_states = torch.zeros(
-                            (batch_size, 1, cross_attention_dim), 
-                            device=self.device
-                        )
-                        
-                        # Denoising loop
-                        for t in self.progress_bar(self.scheduler.timesteps):
-                            # Predict noise residual with conditional generation - FIXED
-                            model_output = self.unet(
-                                noise, 
-                                t, 
-                                encoder_hidden_states=dummy_encoder_hidden_states,
-                                class_labels=class_labels
-                            ).sample
-                            
-                            # Apply denoising step
-                            noise = self.scheduler.step(model_output, t, noise).prev_sample
-                        
-                        # Convert to desired output format
-                        if output_type == "latent":
-                            return noise
-                        
-                        # Normalize from [-1, 1] to [0, 1]
-                        sample = (noise + 1.0) / 2.0
-                        sample = sample.clamp(0.0, 1.0)
-                        
-                        if output_type == "np":
-                            sample = sample.cpu().permute(0, 2, 3, 1).numpy()
-                        
-                        return {"sample": sample}
-
+                
+                # Use conditional pipeline
                 pipeline = ConditionalDDPMPipeline(
                     unet=unet,
                     scheduler=noise_scheduler,
                 )
 
                 generator = torch.Generator(device=pipeline.device).manual_seed(0)
-                # run pipeline in inference (sample random noise and denoise)
-                images = pipeline(
+
+                # Create labels for generation
+                class_labels = torch.zeros(
+                    (14, 14), device=pipeline.device
+                )
+                # (args.eval_batch_size, 14), device=pipeline.device
+                # CheXpert class labels
+                CHEXPERT_CLASSES = [
+                    "No Finding",
+                    "Enlarged Cardiomediastinum",
+                    "Cardiomegaly",
+                    "Lung Opacity",
+                    "Lung Lesion",
+                    "Edema",
+                    "Consolidation",
+                    "Pneumonia",
+                    "Atelectasis",
+                    "Pneumothorax",
+                    "Pleural Effusion",
+                    "Pleural Other",
+                    "Fracture",
+                    "Support Devices",
+                ]
+                
+                # Set the first few classes for visualization
+                for i in range(len(CHEXPERT_CLASSES)):
+                    class_labels[i, i % len(CHEXPERT_CLASSES)] = 1.0
+
+                # Generate images with conditioning - only difference is passing class_labels
+                result = pipeline(
                     generator=generator,
-                    batch_size=args.eval_batch_size,
+                    batch_size=len(CHEXPERT_CLASSES),#args.eval_batch_size,
                     num_inference_steps=args.ddpm_num_inference_steps,
                     output_type="np",
-                ).sample
+                    class_labels=class_labels,
+                    guidance_scale=3.0,
+                )
+                images = result["images"]
 
-                # Create different class conditional samples
-                images_list = []
-                label_descriptions = []
-                
-                # Generate images with specific conditions
-                for condition_idx, condition_name in enumerate(['No Finding', 'Cardiomegaly', 'Pleural Effusion']):
-                    # Find the index of this condition in our class list
-                    if condition_name in CHEXPERT_CLASSES:
-                        class_idx = CHEXPERT_CLASSES.index(condition_name)
-                        # Create one-hot encoded labels with the single condition active
-                        one_hot_labels = torch.zeros(args.eval_batch_size, len(CHEXPERT_CLASSES), device=pipeline.device)
-                        one_hot_labels[:, class_idx] = 1.0
-                        
-                        # Generate images with this condition
-                        condition_images = pipeline(
-                            generator=generator,
-                            batch_size=args.eval_batch_size,
-                            num_inference_steps=args.ddpm_num_inference_steps,
-                            output_type="np",
-                            class_labels=one_hot_labels
-                        ).sample
-                        
-                        images_list.append(condition_images)
-                        label_descriptions.extend([condition_name] * args.eval_batch_size)
-                
-                # Combine all images for visualization
-                all_images = np.concatenate(images_list, axis=0) if images_list else images
-                
+                if args.use_ema:
+                    ema_model.restore(unet.parameters())
+
+                # Keep the exact same image processing that works in the original code
                 # Since our images are grayscale, we need to repeat across channels for visualization
-                all_images = all_images.repeat(3, axis=3) if len(all_images.shape) == 3 and all_images.shape[-1] == 1 else all_images
-                
-                # denormalize the images and save to tensorboard
-                images_processed = (all_images * 255).round().astype("uint8")
+                images = np.repeat(
+                    images, 3, axis=3
+                )  # Repeat the single channel three times to make RGB
 
-                # Log images to tensorboard with labels
+                # denormalize the images and save to tensorboard (same as original)
+                images_processed = (images * 255).round().astype("uint8")
+
+                # Log images to tensorboard (same as original)
                 if is_accelerate_version(">=", "0.17.0.dev0"):
                     tracker = accelerator.get_tracker("tensorboard", unwrap=True)
                 else:
                     tracker = accelerator.get_tracker("tensorboard")
-                
-                # Add images with descriptions
-                for i, (img, label) in enumerate(zip(images_processed, label_descriptions)):
-                    img_tensor = torch.tensor(img.transpose(2, 0, 1))  # Convert to CHW format
-                    tracker.add_image(f"sample_{i}_{label}", img_tensor, epoch)
-                
-                # Also add as a grid for comparison
-                tracker.add_images("conditional_samples", images_processed.transpose(0, 3, 1, 2), epoch)
 
-                if args.use_ema:
-                    ema_model.restore(unet.parameters())
-
-            if epoch % args.save_model_epochs == 0 or epoch == args.num_epochs - 1:
-                # save the model
-                unet = accelerator.unwrap_model(model)
-
-                if args.use_ema:
-                    ema_model.store(unet.parameters())
-                    ema_model.copy_to(unet.parameters())
-
-                pipeline = DDPMPipeline(
-                    unet=unet,
-                    scheduler=noise_scheduler,
+                tracker.add_images(
+                    "test_samples", images_processed.transpose(0, 3, 1, 2), epoch
                 )
 
-                pipeline.save_pretrained(args.output_dir)
+                # Also save as individual images for inspection
+                os.makedirs(
+                    os.path.join(args.output_dir, f"samples_epoch_{epoch}"),
+                    exist_ok=True,
+                )
+                for i, image in enumerate(images_processed):
+                    # Convert to PIL and save
+                    Image.fromarray(image).save(
+                        os.path.join(
+                            args.output_dir, f"samples_epoch_{epoch}", f"sample_{CHEXPERT_CLASSES[i]}.png"
+                        )
+                    )
 
-                if args.use_ema:
-                    ema_model.restore(unet.parameters())
+                # Save the model if it's a save_model_epoch
+                if epoch % args.save_model_epochs == 0 or epoch == args.num_epochs - 1:
+                    # save the model
+                    pipeline.save_pretrained(
+                        os.path.join(args.output_dir, f"model_epoch_{epoch}")
+                    )
+
+        accelerator.wait_for_everyone()
 
     accelerator.end_training()
 
@@ -744,14 +772,4 @@ if __name__ == "__main__":
 
 
 
-
-# python modified_ddpm_train.py \
-#   --data_dir CheXpert-v1.0-small \
-#   --output_dir ./chest_xray_diffusion \
-#   --resolution 128 \
-#   --train_batch_size 2 \
-#   --num_epochs 100 \
-#   --dataloader_num_workers 4 \
-#   --learning_rate 1e-4 \
-#   --use_ema \
-#   --mixed_precision fp16
+# Run using: python conditional_ddpm_train_v2.py   --data_dir CheXpert-v1.0-small   --output_dir ./chest_xray_diffusion   --resolution 128   --train_batch_size 4  --num_epochs 100   --dataloader_num_workers 4   --learning_rate 1e-4   --use_ema   --mixed_precision fp16 --debug_mode

@@ -5,7 +5,7 @@ import math
 import os
 import shutil
 from datetime import timedelta
-from pathlib import Path
+
 
 import accelerate
 import torch
@@ -24,221 +24,9 @@ from diffusers.utils import is_accelerate_version, is_tensorboard_available
 from diffusers.utils.import_utils import is_xformers_available
 import os
 
-import pandas as pd
-import pytorch_lightning as pl
-import torch
-import torchvision.io as io
-from torch.utils.data import DataLoader, Dataset, random_split
+
+
 from src.data.chexpert_datamodule import CheXpertDataModule
-
-
-"""
-PyTorch Lightning DataModule for CheXpert dataset, adapted for diffusion model training.
-"""
-
-
-
-
-# class CheXpertDiffusionDataset(Dataset):
-#     """
-#     CheXpert dataset adapted for diffusion model training.
-#     Focus on image processing without labels.
-#     """
-
-#     def __init__(
-#         self,
-#         csv_file: str,
-#         base_dir: str,
-#         img_size=224,
-#         debug_mode: bool = False,
-#     ):
-#         """
-#         Args:
-#             csv_file: Path to the csv file with annotations.
-#             base_dir: Base directory containing images.
-#             img_size: Size for image resizing.
-#             debug_mode: If True, only use a small subset of data for debugging.
-#         """
-
-#         # Define findings (labels) list
-#         self.findings = [
-#             "No Finding",
-#             "Enlarged Cardiomediastinum",
-#             "Cardiomegaly",
-#             "Lung Opacity",
-#             "Lung Lesion",
-#             "Edema",
-#             "Consolidation",
-#             "Pneumonia",
-#             "Atelectasis",
-#             "Pneumothorax",
-#             "Pleural Effusion",
-#             "Pleural Other",
-#             "Fracture",
-#             "Support Devices",
-#         ]
-
-#         # Load and filter data
-#         df = pd.read_csv(csv_file)
-
-#         # Filter for frontal images with AP projection
-#         filtered_df = df[(df["Frontal/Lateral"] == "Frontal") & (df["AP/PA"] == "AP")]
-
-#         # Select only necessary columns
-#         filtered_df = filtered_df[["Path"]]
-
-#         self.data_frame = filtered_df
-
-#         # Debug mode to use a small subset
-#         if debug_mode:
-#             self.data_frame = self.data_frame.iloc[: min(1000, len(self.data_frame))]
-
-#         # Set up class variables
-#         self.base_dir = base_dir[:-len("/CheXpert-v1.0-small")]# if base_dir.endswith("/CheXpert-v1.0-small") else base_dir
-#         self.img_size = img_size
-
-#         print(f"Dataset size: {len(self.data_frame)}")
-
-#     def __len__(self):
-#         return len(self.data_frame)
-
-#     def __getitem__(self, idx):
-#         """
-#         Get a sample from the dataset, optimized for diffusion model training.
-#         """
-#         # Get image path
-#         rel_path = self.data_frame.iloc[idx]["Path"]
-        
-#         img_path = os.path.join(self.base_dir, rel_path)
-
-#         # Read the image using torchvision
-#         image = io.read_image(img_path, mode=io.ImageReadMode.GRAY)
-
-#         # Convert to float and normalize
-#         image = image.float() / 255.0
-
-#         # Resize if needed
-#         if image.shape[1] != self.img_size or image.shape[2] != self.img_size:
-#             image = torch.nn.functional.interpolate(
-#                 image.unsqueeze(0),
-#                 size=(self.img_size, self.img_size),
-#                 mode="bilinear",
-#                 align_corners=False,
-#             ).squeeze(0)
-
-#         # Normalize to [-1, 1] for diffusion models
-#         image = image * 2.0 - 1.0
-
-#         return {"image": image}  # Return as dict for consistency
-
-
-
-
-
-# class CheXpertDiffusionDataModule(pl.LightningDataModule):
-#     """
-#     PyTorch Lightning DataModule for the CheXpert dataset, adapted for diffusion models.
-#     """
-
-#     def __init__(
-#         self,
-#         data_dir,
-#         img_size=224,
-#         batch_size=16,
-#         num_workers=4,
-#         seed=42,
-#         debug_mode=True,
-#         pin_memory=True,
-#     ):
-#         super().__init__()
-#         self.data_dir = data_dir
-#         self.img_size = img_size
-#         self.batch_size = batch_size
-#         self.num_workers = num_workers
-#         self.seed = seed
-#         self.debug_mode = debug_mode
-#         self.pin_memory = pin_memory
-
-#     def prepare_data(self):
-#         """Check if data directory and required files exist."""
-#         if not os.path.exists(self.data_dir):
-#             raise ValueError(f"Data directory not found: {self.data_dir}")
-
-#         train_csv = os.path.join(self.data_dir, "train.csv")
-#         valid_csv = os.path.join(self.data_dir, "valid.csv")
-
-#         if not os.path.exists(train_csv):
-#             raise FileNotFoundError(f"Train CSV file not found: {train_csv}")
-#         if not os.path.exists(valid_csv):
-#             raise FileNotFoundError(f"Valid CSV file not found: {valid_csv}")
-
-#     def setup(self, stage=None):
-#         """Set up train, validation, and test datasets."""
-#         train_csv = os.path.join(self.data_dir, "train.csv")
-#         valid_csv = os.path.join(self.data_dir, "valid.csv")
-
-#         if stage == "fit" or stage is None:
-#             self.train_dataset = CheXpertDiffusionDataset(
-#                 csv_file=train_csv,
-#                 base_dir=self.data_dir,
-#                 debug_mode=self.debug_mode,
-#                 img_size=self.img_size,
-#             )
-
-#             val_dataset = CheXpertDiffusionDataset(
-#                 csv_file=valid_csv,
-#                 base_dir=self.data_dir,
-#                 debug_mode=self.debug_mode,
-#                 img_size=self.img_size,
-#             )
-
-#             # Split validation into val and test
-#             val_size = int(0.9 * len(val_dataset))
-#             test_size = len(val_dataset) - val_size
-
-#             self.val_dataset, self.test_dataset = random_split(
-#                 val_dataset,
-#                 [val_size, test_size],
-#                 generator=torch.Generator().manual_seed(self.seed),
-#             )
-
-#     def train_dataloader(self):
-#         """Return training dataloader."""
-#         return DataLoader(
-#             self.train_dataset,
-#             batch_size=self.batch_size,
-#             shuffle=True,
-#             num_workers=self.num_workers,
-#             pin_memory=self.pin_memory,
-#             drop_last=True,
-#             persistent_workers=self.num_workers > 0,
-#         )
-
-#     def val_dataloader(self):
-#         """Return validation dataloader."""
-#         return DataLoader(
-#             self.val_dataset,
-#             batch_size=self.batch_size,
-#             shuffle=False,
-#             num_workers=self.num_workers,
-#             pin_memory=self.pin_memory,
-#             drop_last=False,
-#             persistent_workers=self.num_workers > 0,
-#         )
-
-#     def test_dataloader(self):
-#         """Return test dataloader."""
-#         return DataLoader(
-#             self.test_dataset,
-#             batch_size=self.batch_size,
-#             shuffle=False,
-#             num_workers=self.num_workers,
-#             pin_memory=self.pin_memory,
-#             drop_last=False,
-#             persistent_workers=self.num_workers > 0,
-#         )
-
-
 
 logger = get_logger(__name__, log_level="INFO")
 
@@ -499,8 +287,8 @@ def main(args):
     # Initialize the model - modified for grayscale chest X-rays
     model = UNet2DModel(
         sample_size=args.resolution,
-        in_channels=1,  # Changed from 3 to 1 for grayscale X-rays
-        out_channels=1,  # Changed from 3 to 1 for grayscale X-rays
+        in_channels=1,  
+        out_channels=1,  
         layers_per_block=2,
         block_out_channels=(128, 128, 256, 256, 512, 512),
         down_block_types=(
