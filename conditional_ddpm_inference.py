@@ -63,16 +63,22 @@ def parse_args():
         default=4,
         help="Batch size for generation",
     )
+    parser.add_argument(
+        "--ambient",
+        action="store_true",
+        help="Use ambient diffusion model",
+    )
     
     return parser.parse_args()
 
-def load_model(model_path):
+def load_model(model_path, ambient=False):
     """
     Load a trained DDPM model from the specified path manually
     """
     # Importamos aquí para evitar problemas de importación circular
     from src.models.cfg_diffusion import CustomClassConditionedUnet
     from src.models.conditional_ddpm_pipeline import ConditionalDDPMPipeline
+    from src.models.ambient_diffusion import AmbientDDPMPipeline
     
     print(f"Loading model components from {model_path}")
     
@@ -103,10 +109,16 @@ def load_model(model_path):
             )
         
         # Crear pipeline manualmente
-        pipeline = ConditionalDDPMPipeline(
-            unet=unet,
-            scheduler=scheduler
-        )
+        if ambient:
+            pipeline = AmbientDDPMPipeline(
+                unet=unet,
+                scheduler=scheduler
+            )
+        else:
+            pipeline = ConditionalDDPMPipeline(
+                unet=unet,
+                scheduler=scheduler
+            )
         
         # Mover a GPU si está disponible
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -298,7 +310,7 @@ def main():
         print(f"Will generate images for all {len(CHEXPERT_CLASSES)} conditions")
     
     # Load the model
-    pipeline = load_model(args.model_path)
+    pipeline = load_model(args.model_path, ambient=args.ambient)
     
     # Create class conditions
     class_labels, condition_names = create_class_conditions(args.conditions, pipeline.device)

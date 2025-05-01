@@ -28,10 +28,9 @@ from src.models.cfg_diffusion import CustomClassConditionedUnet
 from src.utils.helpers import _extract_into_tensor
 from src.utils.constants import CHEXPERT_CLASSES
 from src.models.conditional_ddpm_pipeline import ConditionalDDPMPipeline
+from src.models.ambient_diffusion import make_ambient_batch, ambient_loss
+
 logger = get_logger(__name__, log_level="INFO")
-
-
-
 
 
 def parse_args():
@@ -85,7 +84,11 @@ def parse_args():
             " process."
         ),
     )
-    parser.add_argument("--num_epochs", type=int, default=100)
+    parser.add_argument(
+        "--num_epochs",
+        type=int, 
+        default=100)
+    
     parser.add_argument(
         "--save_images_epochs",
         type=int,
@@ -261,13 +264,34 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--original_dememorization",
+        action="store_true",
+        help="Use original dememorization method",
+    )
+
+    parser.add_argument(
         "--tau", type=float, default=3.0, help="Tau value for dememorization"
     )
 
     parser.add_argument(
-        "--ambient_diff_tau", type=float, default=1.0, help="Tau value for ambient diffusion"
+        "--ambient",
+        action="store_true",
+        help="Use ambient diffusion model",
     )
 
+    parser.add_argument(
+        "--ambient_p",
+        type=float,
+        default=0.9,
+        help="Bernoulli keep-prob for primary inpainting mask A",
+    )
+
+    parser.add_argument(
+        "--ambient_delta",
+        type=float,
+        default=0.05,
+        help="Extra drop-prob δ for secondary mask ˜A",
+    )
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -527,7 +551,11 @@ def main(args):
 
         for step, batch in enumerate(train_dataloader):
             # Skip steps until resumed step
-            if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
+            if (
+                args.resume_from_checkpoint
+                and epoch == first_epoch
+                and step < resume_step
+            ):
                 if step % args.gradient_accumulation_steps == 0:
                     progress_bar.update(1)
                 continue
@@ -539,75 +567,145 @@ def main(args):
             batch_size = clean_images.size(0)
 
             use_conditioning_mask = (
-                torch.rand(batch_size, device=clean_images.device) >= guidance_dropout_prob
+                torch.rand(batch_size, device=clean_images.device)
+                >= guidance_dropout_prob
             )
 
             conditional_input = class_labels.clone()
-            conditional_input[~use_conditioning_mask] = torch.zeros_like(class_labels[~use_conditioning_mask])
+            conditional_input[~use_conditioning_mask] = torch.zeros_like(
+                class_labels[~use_conditioning_mask]
+            )
 
             tau = getattr(args, "tau", 1.0)
 
-            noise = torch.randn(clean_images.shape, dtype=weight_dtype, device=clean_images.device)
+            noise = torch.randn(
+                clean_images.shape, dtype=weight_dtype, device=clean_images.device
+            )
             timesteps = torch.randint(
-                0, noise_scheduler.config.num_train_timesteps, (batch_size,), device=clean_images.device
+                0,
+                noise_scheduler.config.num_train_timesteps,
+                (batch_size,),
+                device=clean_images.device,
             ).long()
 
-            noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
+            if args.ambient:
+                noisy_images, A_mask = make_ambient_batch(
+                    clean_images, noise_scheduler, timesteps
+                )
+            else:
+                noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
 
             with accelerator.accumulate(model):
-                # Conditional prediction
-                cond_output = model(
-                    sample=noisy_images,
-                    timestep=timesteps,
-                    class_labels=conditional_input,
-                ).sample
+                if args.original_dememorization:
+                    # Conditional prediction
+                    cond_output = model(
+                        sample=noisy_images,
+                        timestep=timesteps,
+                        class_labels=conditional_input,
+                    ).sample
 
-                # Unconditional prediction
-                uncond_labels = torch.zeros_like(class_labels)
-                uncond_output = model(
-                    sample=noisy_images,
-                    timestep=timesteps,
-                    class_labels=uncond_labels,
-                ).sample
+                    # Unconditional prediction
+                    uncond_labels = torch.zeros_like(class_labels)
+                    uncond_output = model(
+                        sample=noisy_images,
+                        timestep=timesteps,
+                        class_labels=uncond_labels,
+                    ).sample
 
-                # Magnitude difference calculation
-                diff = cond_output - uncond_output                 # [B, C, H, W]
-                flat = diff.flatten(start_dim=1)                   # [B, C*H*W]
-                magnitude_diff = torch.linalg.norm(flat, dim=1)
+                    # Magnitude difference calculation
+                    diff = cond_output - uncond_output  # [B, C, H, W]
+                    flat = diff.flatten(start_dim=1)  # [B, C*H*W]
+                    magnitude_diff = torch.linalg.norm(flat, dim=1)
 
-                valid_mask = magnitude_diff <= tau
-                percent_filtered = (1.0 - valid_mask.float().mean()) * 100
-                accelerator.log({"percent_filtered": percent_filtered.item()}, step=global_step)
+                    valid_mask = magnitude_diff <= tau
+                    percent_filtered = (1.0 - valid_mask.float().mean()) * 100
 
-                if valid_mask.any():
+                    if valid_mask.any():
+                        if args.prediction_type == "epsilon":
+                            loss = F.mse_loss(
+                                cond_output[valid_mask].float(),
+                                noise[valid_mask].float(),
+                            )
+                        elif args.prediction_type == "sample":
+                            alpha_t = _extract_into_tensor(
+                                noise_scheduler.alphas_cumprod,
+                                timesteps,
+                                (batch_size, 1, 1, 1),
+                            )
+                            snr_weights = alpha_t / (1 - alpha_t)
+                            loss = snr_weights[valid_mask] * F.mse_loss(
+                                cond_output[valid_mask].float(),
+                                clean_images[valid_mask].float(),
+                                reduction="none",
+                            )
+                            loss = loss.mean()
+                        else:
+                            raise ValueError(
+                                f"Unsupported prediction type: {args.prediction_type}"
+                            )
+                    else:
+                        loss = torch.tensor(
+                            0.0, device=clean_images.device, requires_grad=True
+                        )
+
+                    accelerator.backward(loss)
+
+                    if accelerator.sync_gradients:
+                        accelerator.clip_grad_norm_(model.parameters(), 1.0)
+
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad()
+                else:
+                    # Predict the noise residual
+                    model_output = model(
+                        sample=noisy_images,
+                        timestep=timesteps,
+                        class_labels=conditional_input,
+                    ).sample
+
+                    if args.ambient:
+                        # Force sampling for ambient diffusion
+                        args.prediction_type = "sample"
+
                     if args.prediction_type == "epsilon":
                         loss = F.mse_loss(
-                            cond_output[valid_mask].float(), noise[valid_mask].float()
-                        )
+                            model_output.float(), noise.float()
+                        )  # this could have different weights!
+
                     elif args.prediction_type == "sample":
                         alpha_t = _extract_into_tensor(
-                            noise_scheduler.alphas_cumprod, timesteps, (batch_size, 1, 1, 1)
+                            noise_scheduler.alphas_cumprod,
+                            timesteps,
+                            (clean_images.shape[0], 1, 1, 1),
                         )
                         snr_weights = alpha_t / (1 - alpha_t)
-                        loss = snr_weights[valid_mask] * F.mse_loss(
-                            cond_output[valid_mask].float(),
-                            clean_images[valid_mask].float(),
-                            reduction="none",
-                        )
+                        # use SNR weighting from distillation paper
+                        if args.ambient:
+                            loss = ambient_loss(
+                                model_output,
+                                clean_images,
+                                A_mask,
+                            )
+                        else:
+                            loss = snr_weights * F.mse_loss(
+                                model_output.float(),
+                                clean_images.float(),
+                                reduction="none",
+                            )
                         loss = loss.mean()
                     else:
-                        raise ValueError(f"Unsupported prediction type: {args.prediction_type}")
-                else:
-                    loss = torch.tensor(0.0, device=clean_images.device, requires_grad=True)
+                        raise ValueError(
+                            f"Unsupported prediction type: {args.prediction_type}"
+                        )
 
-                accelerator.backward(loss)
+                    accelerator.backward(loss)
 
-                if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(model.parameters(), 1.0)
-
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
+                    if accelerator.sync_gradients:
+                        accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad()
 
             if accelerator.sync_gradients:
                 if args.use_ema:
@@ -615,18 +713,29 @@ def main(args):
                 progress_bar.update(1)
                 global_step += 1
 
-                if accelerator.is_main_process and global_step % args.checkpointing_steps == 0:
+                if (
+                    accelerator.is_main_process
+                    and global_step % args.checkpointing_steps == 0
+                ):
                     if args.checkpoints_total_limit is not None:
                         checkpoints = sorted(
-                            [d for d in os.listdir(args.output_dir) if d.startswith("checkpoint")],
-                            key=lambda x: int(x.split("-")[1])
+                            [
+                                d
+                                for d in os.listdir(args.output_dir)
+                                if d.startswith("checkpoint")
+                            ],
+                            key=lambda x: int(x.split("-")[1]),
                         )
 
                         if len(checkpoints) >= args.checkpoints_total_limit:
-                            for chkpt in checkpoints[:len(checkpoints) - args.checkpoints_total_limit + 1]:
+                            for chkpt in checkpoints[
+                                : len(checkpoints) - args.checkpoints_total_limit + 1
+                            ]:
                                 shutil.rmtree(os.path.join(args.output_dir, chkpt))
 
-                    save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                    save_path = os.path.join(
+                        args.output_dir, f"checkpoint-{global_step}"
+                    )
                     accelerator.save_state(save_path)
                     logger.info(f"Saved checkpoint to {save_path}")
 
@@ -634,10 +743,12 @@ def main(args):
                 "loss": loss.item(),
                 "lr": lr_scheduler.get_last_lr()[0],
                 "step": global_step,
-                "percent_filtered": percent_filtered.item(),
             }
+            if 'percent_filtered' in locals():
+                logs["percent_filtered"] = percent_filtered.item()
             if args.use_ema:
                 logs["ema_decay"] = ema_model.cur_decay_value
+            accelerator.log(logs, step=global_step)
 
         progress_bar.close()
 
@@ -645,16 +756,13 @@ def main(args):
 
         # Generate sample images for visual inspection
         if accelerator.is_main_process:
-            
             if (epoch % args.save_images_epochs == 0) or epoch == args.num_epochs - 1:
-            
                 unet = accelerator.unwrap_model(model)
 
                 if args.use_ema:
                     ema_model.store(unet.parameters())
                     ema_model.copy_to(unet.parameters())
 
-                
                 # Use conditional pipeline
                 pipeline = ConditionalDDPMPipeline(
                     unet=unet,
@@ -664,9 +772,7 @@ def main(args):
                 generator = torch.Generator(device=pipeline.device).manual_seed(0)
 
                 # Create labels for generation
-                class_labels = torch.zeros(
-                    (14, 14), device=pipeline.device
-                )
+                class_labels = torch.zeros((14, 14), device=pipeline.device)
                 # (args.eval_batch_size, 14), device=pipeline.device
                 # CheXpert class labels
                 CHEXPERT_CLASSES = [
@@ -685,7 +791,7 @@ def main(args):
                     "Fracture",
                     "Support Devices",
                 ]
-                
+
                 # Set the first few classes for visualization
                 for i in range(len(CHEXPERT_CLASSES)):
                     class_labels[i, i % len(CHEXPERT_CLASSES)] = 1.0
@@ -693,7 +799,7 @@ def main(args):
                 # Generate images with conditioning - only difference is passing class_labels
                 result = pipeline(
                     generator=generator,
-                    batch_size=len(CHEXPERT_CLASSES),#args.eval_batch_size,
+                    batch_size=len(CHEXPERT_CLASSES),  # args.eval_batch_size,
                     num_inference_steps=args.ddpm_num_inference_steps,
                     output_type="np",
                     class_labels=class_labels,
@@ -732,7 +838,9 @@ def main(args):
                     # Convert to PIL and save
                     Image.fromarray(image).save(
                         os.path.join(
-                            args.output_dir, f"samples_epoch_{epoch}", f"sample_{CHEXPERT_CLASSES[i]}.png"
+                            args.output_dir,
+                            f"samples_epoch_{epoch}",
+                            f"sample_{CHEXPERT_CLASSES[i]}.png",
                         )
                     )
 
@@ -751,7 +859,6 @@ def main(args):
 if __name__ == "__main__":
     args = parse_args()
     main(args)
-
 
 
 # Run using: python conditional_ddpm_train_v2.py   --data_dir CheXpert-v1.0-small   --output_dir ./chest_xray_diffusion   --resolution 128   --train_batch_size 4  --num_epochs 100   --dataloader_num_workers 4   --learning_rate 1e-4   --use_ema   --mixed_precision fp16 --debug_mode
