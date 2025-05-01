@@ -260,6 +260,15 @@ def parse_args():
         "--seed", type=int, default=42, help="Random seed for initialization"
     )
 
+    parser.add_argument(
+        "--tau", type=float, default=3.0, help="Tau value for dememorization"
+    )
+
+    parser.add_argument(
+        "--ambient_diff_tau", type=float, default=1.0, help="Tau value for ambient diffusion"
+    )
+
+
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
@@ -517,12 +526,8 @@ def main(args):
         progress_bar.set_description(f"Epoch {epoch}")
 
         for step, batch in enumerate(train_dataloader):
-            # Skip steps until we reach the resumed step
-            if (
-                args.resume_from_checkpoint
-                and epoch == first_epoch
-                and step < resume_step
-            ):
+            # Skip steps until resumed step
+            if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
                 if step % args.gradient_accumulation_steps == 0:
                     progress_bar.update(1)
                 continue
@@ -530,132 +535,109 @@ def main(args):
             clean_images = batch["image"].to(weight_dtype)
             class_labels = batch["labels"].to(weight_dtype)
 
-            # For each batch, randomly drop some class labels
-            # to create a mix of conditional and unconditional samples
             guidance_dropout_prob = 0.1
-            batch_size = clean_images.shape[0]
+            batch_size = clean_images.size(0)
 
             use_conditioning_mask = (
-                torch.rand(batch_size, device=clean_images.device)
-                >= guidance_dropout_prob
+                torch.rand(batch_size, device=clean_images.device) >= guidance_dropout_prob
             )
 
-            # Crear vector de condicionamiento donde algunas muestras tendrán etiquetas nulas
             conditional_input = class_labels.clone()
-            conditional_input[~use_conditioning_mask] = torch.zeros_like(
-                conditional_input[~use_conditioning_mask]
-            )
+            conditional_input[~use_conditioning_mask] = torch.zeros_like(class_labels[~use_conditioning_mask])
 
-            # Sample noise that we'll add to the images
-            noise = torch.randn(
-                clean_images.shape, dtype=weight_dtype, device=clean_images.device
-            )
-            bsz = clean_images.shape[0]
+            tau = getattr(args, "tau", 1.0)
 
-            # Sample a random timestep for each image
+            noise = torch.randn(clean_images.shape, dtype=weight_dtype, device=clean_images.device)
             timesteps = torch.randint(
-                0,
-                noise_scheduler.config.num_train_timesteps,
-                (bsz,),
-                device=clean_images.device,
+                0, noise_scheduler.config.num_train_timesteps, (batch_size,), device=clean_images.device
             ).long()
 
-            # Add noise to the clean images according to the noise magnitude at each timestep
-            # (this is the forward diffusion process)
             noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
 
             with accelerator.accumulate(model):
-                # Predict the noise residual
-                model_output = model(
+                # Conditional prediction
+                cond_output = model(
                     sample=noisy_images,
                     timestep=timesteps,
                     class_labels=conditional_input,
                 ).sample
 
-                if args.prediction_type == "epsilon":
-                    loss = F.mse_loss(
-                        model_output.float(), noise.float()
-                    )  # this could have different weights!
+                # Unconditional prediction
+                uncond_labels = torch.zeros_like(class_labels)
+                uncond_output = model(
+                    sample=noisy_images,
+                    timestep=timesteps,
+                    class_labels=uncond_labels,
+                ).sample
 
-                elif args.prediction_type == "sample":
-                    alpha_t = _extract_into_tensor(
-                        noise_scheduler.alphas_cumprod,
-                        timesteps,
-                        (clean_images.shape[0], 1, 1, 1),
-                    )
-                    snr_weights = alpha_t / (1 - alpha_t)
-                    # use SNR weighting from distillation paper
-                    loss = snr_weights * F.mse_loss(
-                        model_output.float(), clean_images.float(), reduction="none"
-                    )
-                    loss = loss.mean()
+                # Magnitude difference calculation
+                diff = cond_output - uncond_output                 # [B, C, H, W]
+                flat = diff.flatten(start_dim=1)                   # [B, C*H*W]
+                magnitude_diff = torch.linalg.norm(flat, dim=1)
+
+                valid_mask = magnitude_diff <= tau
+                percent_filtered = (1.0 - valid_mask.float().mean()) * 100
+                accelerator.log({"percent_filtered": percent_filtered.item()}, step=global_step)
+
+                if valid_mask.any():
+                    if args.prediction_type == "epsilon":
+                        loss = F.mse_loss(
+                            cond_output[valid_mask].float(), noise[valid_mask].float()
+                        )
+                    elif args.prediction_type == "sample":
+                        alpha_t = _extract_into_tensor(
+                            noise_scheduler.alphas_cumprod, timesteps, (batch_size, 1, 1, 1)
+                        )
+                        snr_weights = alpha_t / (1 - alpha_t)
+                        loss = snr_weights[valid_mask] * F.mse_loss(
+                            cond_output[valid_mask].float(),
+                            clean_images[valid_mask].float(),
+                            reduction="none",
+                        )
+                        loss = loss.mean()
+                    else:
+                        raise ValueError(f"Unsupported prediction type: {args.prediction_type}")
                 else:
-                    raise ValueError(
-                        f"Unsupported prediction type: {args.prediction_type}"
-                    )
+                    loss = torch.tensor(0.0, device=clean_images.device, requires_grad=True)
 
                 accelerator.backward(loss)
 
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(model.parameters(), 1.0)
+
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
 
-            # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
                 if args.use_ema:
                     ema_model.step(model.parameters())
                 progress_bar.update(1)
                 global_step += 1
 
-                if accelerator.is_main_process:
-                    if global_step % args.checkpointing_steps == 0:
-                        # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
-                        if args.checkpoints_total_limit is not None:
-                            checkpoints = os.listdir(args.output_dir)
-                            checkpoints = [
-                                d for d in checkpoints if d.startswith("checkpoint")
-                            ]
-                            checkpoints = sorted(
-                                checkpoints, key=lambda x: int(x.split("-")[1])
-                            )
-
-                            # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
-                            if len(checkpoints) >= args.checkpoints_total_limit:
-                                num_to_remove = (
-                                    len(checkpoints) - args.checkpoints_total_limit + 1
-                                )
-                                removing_checkpoints = checkpoints[0:num_to_remove]
-
-                                logger.info(
-                                    f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
-                                )
-                                logger.info(
-                                    f"removing checkpoints: {', '.join(removing_checkpoints)}"
-                                )
-
-                                for removing_checkpoint in removing_checkpoints:
-                                    removing_checkpoint = os.path.join(
-                                        args.output_dir, removing_checkpoint
-                                    )
-                                    shutil.rmtree(removing_checkpoint)
-
-                        save_path = os.path.join(
-                            args.output_dir, f"checkpoint-{global_step}"
+                if accelerator.is_main_process and global_step % args.checkpointing_steps == 0:
+                    if args.checkpoints_total_limit is not None:
+                        checkpoints = sorted(
+                            [d for d in os.listdir(args.output_dir) if d.startswith("checkpoint")],
+                            key=lambda x: int(x.split("-")[1])
                         )
-                        accelerator.save_state(save_path)
-                        logger.info(f"Saved state to {save_path}")
+
+                        if len(checkpoints) >= args.checkpoints_total_limit:
+                            for chkpt in checkpoints[:len(checkpoints) - args.checkpoints_total_limit + 1]:
+                                shutil.rmtree(os.path.join(args.output_dir, chkpt))
+
+                    save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                    accelerator.save_state(save_path)
+                    logger.info(f"Saved checkpoint to {save_path}")
 
             logs = {
-                "loss": loss.detach().item(),
+                "loss": loss.item(),
                 "lr": lr_scheduler.get_last_lr()[0],
                 "step": global_step,
+                "percent_filtered": percent_filtered.item(),
             }
             if args.use_ema:
                 logs["ema_decay"] = ema_model.cur_decay_value
-            progress_bar.set_postfix(**logs)
-            accelerator.log(logs, step=global_step)
 
         progress_bar.close()
 
