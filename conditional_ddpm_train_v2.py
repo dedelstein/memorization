@@ -28,7 +28,7 @@ from src.models.cfg_diffusion import CustomClassConditionedUnet
 from src.utils.helpers import _extract_into_tensor
 from src.utils.constants import CHEXPERT_CLASSES
 from src.models.conditional_ddpm_pipeline import ConditionalDDPMPipeline
-from src.models.ambient_diffusion import make_ambient_batch, ambient_loss
+from src.models.ambient_diffusion import make_ambient_batch, ambient_loss, AmbientDDPMPipeline
 
 logger = get_logger(__name__, log_level="INFO")
 
@@ -763,11 +763,17 @@ def main(args):
                     ema_model.store(unet.parameters())
                     ema_model.copy_to(unet.parameters())
 
-                # Use conditional pipeline
-                pipeline = ConditionalDDPMPipeline(
+                if args.ambient:
+                    pipeline = AmbientDDPMPipeline(
                     unet=unet,
                     scheduler=noise_scheduler,
+                    p_mask=0.9,                 # keep the same masking probability you used in training
                 )
+                else:
+                    pipeline = ConditionalDDPMPipeline(
+                        unet=unet,
+                        scheduler=noise_scheduler,
+                    )
 
                 generator = torch.Generator(device=pipeline.device).manual_seed(0)
 
@@ -797,14 +803,22 @@ def main(args):
                     class_labels[i, i % len(CHEXPERT_CLASSES)] = 1.0
 
                 # Generate images with conditioning - only difference is passing class_labels
-                result = pipeline(
+                if args.ambient:
+                    result = pipeline(
                     generator=generator,
-                    batch_size=len(CHEXPERT_CLASSES),  # args.eval_batch_size,
+                    batch_size=len(CHEXPERT_CLASSES),
                     num_inference_steps=args.ddpm_num_inference_steps,
                     output_type="np",
-                    class_labels=class_labels,
-                    guidance_scale=3.0,
-                )
+                    )
+                else:
+                    result = pipeline(
+                        generator=generator,
+                        batch_size=len(CHEXPERT_CLASSES),  # args.eval_batch_size,
+                        num_inference_steps=args.ddpm_num_inference_steps,
+                        output_type="np",
+                        class_labels=class_labels,
+                        guidance_scale=3.0,
+                    )
                 images = result["images"]
 
                 if args.use_ema:

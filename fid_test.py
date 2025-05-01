@@ -107,7 +107,7 @@ class XRAYFID(Metric):
     def compute(self):
         mu1, sig1 = self._stats(self.preds_real)
         mu2, sig2 = self._stats(self.preds_fake)
-        return _compute_fid(mu1, sig1, mu2, sig2, self.eps)
+        return _compute_fid(mu1, sig1, mu2, sig2)
 
 #chex_fid = XRAYFID().to(device if torch.cuda.is_available() else "cpu")
 chex_fid = XRAYFID().to(metric_device)
