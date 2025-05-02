@@ -652,10 +652,10 @@ def main(args):
 
                     if accelerator.sync_gradients:
                         accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                        optimizer.step()
+                        lr_scheduler.step()
+                        optimizer.zero_grad()
 
-                    optimizer.step()
-                    lr_scheduler.step()
-                    optimizer.zero_grad()
                 else:
                     # Predict the noise residual
                     model_output = model(
@@ -679,7 +679,7 @@ def main(args):
                             timesteps,
                             (clean_images.shape[0], 1, 1, 1),
                         )
-                        snr_weights = alpha_t / (1 - alpha_t)
+                        snr_weights = alpha_t / (1 - alpha_t + 1e-8)
                         # use SNR weighting from distillation paper
                         if args.ambient:
                             loss = ambient_loss(
@@ -703,9 +703,9 @@ def main(args):
 
                     if accelerator.sync_gradients:
                         accelerator.clip_grad_norm_(model.parameters(), 1.0)
-                    optimizer.step()
-                    lr_scheduler.step()
-                    optimizer.zero_grad()
+                        optimizer.step()
+                        lr_scheduler.step()
+                        optimizer.zero_grad()
 
             if accelerator.sync_gradients:
                 if args.use_ema:

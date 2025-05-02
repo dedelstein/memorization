@@ -4,7 +4,7 @@
 ###############################################################################
 
 ### -- Job information and resources --
-#BSUB -J DDPM_Training_original_128  # Job name
+#BSUB -J DDPM_Training_ambient_128  # Job name
 #BSUB -q gpuv100             # GPU queue for V100s
 #BSUB -n 8                   # Number of cores
 #BSUB -gpu "num=1:mode=exclusive_process"  # Request 1 GPU in exclusive mode
@@ -18,8 +18,8 @@
 ##BSUB -u your_email_address # Uncomment and change to your email for notifications
 
 ### -- Output options --
-#BSUB -o logs/DDPM_org128%J.out    # Standard output log
-#BSUB -e logs/DDPM_org128%J.err    # Error log
+#BSUB -o logs/DDPM_amb128%J.out    # Standard output log
+#BSUB -e logs/DDPM_amb128%J.err    # Error log
 
 ### -- Create log directory if it doesn't exist --
 mkdir -p logs
@@ -57,7 +57,7 @@ echo "Starting training at $(date)"
 echo "Command: python3 train_cfg_diffusion.py --batch_size 4"
 
 # Run training
-python conditional_ddpm_train_v2.py   --data_dir /dtu/blackhole/1d/214141/CheXpert-v1.0-small   --output_dir /dtu/blackhole/1d/214141/chest_xray_diffusion   --resolution 128  --train_batch_size 2  --num_epochs 100   --dataloader_num_workers 4   --learning_rate 1e-4   --use_ema   --mixed_precision no --debug_mode --original_dememorization
+python conditional_ddpm_train_v2.py   --data_dir /dtu/blackhole/1d/214141/CheXpert-v1.0-small   --output_dir /dtu/blackhole/1d/214141/chest_xray_diffusion   --resolution 128  --train_batch_size 2  --num_epochs 100   --dataloader_num_workers 4   --learning_rate 1e-4   --use_ema   --mixed_precision no --debug_mode --ambient
 
 ### -- Job cleanup and information --
 echo "Training finished at $(date)"

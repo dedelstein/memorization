@@ -111,7 +111,7 @@ class AmbientDDPMPipeline(DDPMPipeline):
             device=device,
         )
 
-        self.scheduler.set_timesteps(num_inference_steps)
+        self.scheduler.set_timesteps(num_inference_steps, device=device)
 
         for t in self.scheduler.timesteps:
             eps = self.unet(mask * x, t).sample         # hθ(˜A, ˜A x_t , t)

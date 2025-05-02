@@ -11,6 +11,8 @@ from torchmetrics import Metric
 from conditional_ddpm_inference import load_model
 import torch.nn.functional as F
 from tqdm.auto import tqdm
+import matplotlib.pyplot as plt
+from torchvision.utils import make_grid
 
 BATCH = 32                 # any value that fits on GPU
 IMG_SIZE = 224             # must match the generator
@@ -112,15 +114,40 @@ class XRAYFID(Metric):
 #chex_fid = XRAYFID().to(device if torch.cuda.is_available() else "cpu")
 chex_fid = XRAYFID().to(metric_device)
 
+preview_real  = None
+preview_fake  = None
+
 n_real  = len(real_loader)
 n_fake  = math.ceil(TOTAL / BATCH)
-with tqdm(total=n_real + n_fake, unit="batch") as pbar:
-    for batch in real_loader:
-        chex_fid.update(batch["image"].to(device), real=True)
-        pbar.update()
 
-    for imgs in gen_loader():
+with tqdm(total=n_real + n_fake, unit="batch") as pbar:
+    for i, batch in enumerate(tqdm(real_loader, desc="Real", unit="batch")):
+        imgs = batch["image"].to(device)
+        chex_fid.update(imgs, real=True)
+        if i == 0:                      # keep only the very first batch
+            preview_real = imgs[:16]    # 4×4 grid; adjust if batch < 16
+
+    for i, imgs in enumerate(tqdm(gen_loader(),
+            total=n_fake,
+            desc="Fake", unit="batch")):
         chex_fid.update(imgs, real=False)
-        pbar.update()
+        if i == 0:
+            preview_fake = imgs[:16]
 
 print("CheX-FID =", chex_fid.compute().item())
+
+def save_grid(tensor, fname, title):
+    # tensor in [-1,1] → [0,1]
+    grid = make_grid((tensor + 1) * 0.5, nrow=4, padding=2)
+    npimg = grid.cpu().numpy().transpose(1, 2, 0).squeeze()
+    plt.figure(figsize=(6,6))
+    plt.imshow(npimg, cmap="gray")
+    plt.axis("off")
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(fname, dpi=150)
+    plt.close()
+
+save_grid(preview_real, "preview_real.png", "Real CheXpert (val)")
+save_grid(preview_fake, "preview_fake.png", "Generated (guidance=%.2f)" % GUIDE)
+print("Saved comparison grids → preview_real.png  /  preview_fake.png")
