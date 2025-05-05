@@ -3,17 +3,17 @@ All-in-one utilities for Ambient Diffusion (random-inpainting variant).
 
 Implements
 ----------
-sample_inpainting_mask   – A  (Eq. 3.1)
-further_corrupt          – ˜A (Eq. 3.2)
-make_ambient_batch       – build (˜A x_t , A) for training
-ambient_loss             – J_corr  (Eq. 3.2)
-AmbientDDPMPipeline      – fixed-mask sampler (Eq. 3.3)
+sample_inpainting_mask   - A  (Eq. 3.1)
+further_corrupt          - ~A (Eq. 3.2)
+make_ambient_batch       - build (~A x_t , A) for training
+ambient_loss             - J_corr  (Eq. 3.2)
+AmbientDDPMPipeline      - fixed-mask sampler (Eq. 3.3)
 """
 
 from __future__ import annotations
 import torch
 from torch import Tensor
-from typing import Tuple
+from typing import Tuple, Optional
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from diffusers import DDPMPipeline
 
@@ -33,9 +33,9 @@ def sample_inpainting_mask(
     )
 
 
-def further_corrupt(A: Tensor, δ: float = 0.05) -> Tensor:
-    """Sample ˜A = B A by turning surviving pixels off with prob δ."""
-    B_mat = torch.bernoulli(torch.full_like(A, 1.0 - δ))
+def further_corrupt(A: Tensor, delta: float = 0.05) -> Tensor:
+    """Sample ~A = B A by turning surviving pixels off with prob delta."""
+    B_mat = torch.bernoulli(torch.full_like(A, 1.0 - delta))
     return B_mat * A
 
 # ------------------------------------------------------------------
@@ -47,11 +47,11 @@ def make_ambient_batch(
     noise_scheduler: DDPMScheduler,
     timesteps: Tensor,
     p: float = 0.9,
-    δ: float = 0.05,
+    delta: float = 0.05,
 ) -> tuple[Tensor, Tensor]:
     """
     Returns:
-        y_t_tilde : ˜A x_t   (to feed the network)
+        y_t_tilde : ~A x_t   (to feed the network)
         A_mask    : A        (needed only for the loss)
     """
     B, C, H, W = clean.shape
@@ -64,8 +64,8 @@ def make_ambient_batch(
     noise   = torch.randn_like(clean)
     x_t     = noise_scheduler.add_noise(clean, noise, timesteps)
 
-    # 3.  ˜A x_t
-    A_tilde = further_corrupt(A, δ=δ)
+    # 3.  ~A x_t
+    A_tilde = further_corrupt(A, delta=delta)
     y_t_tilde = A_tilde * x_t
 
     return y_t_tilde, A
@@ -85,17 +85,23 @@ class AmbientDDPMPipeline(DDPMPipeline):
     Fixed-mask sampler (Eq. 3.3).  Drop-in replacement for DDPMPipeline.
     """
 
-    def __init__(self, *args, p_mask: float = 0.9, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.p_mask = p_mask
+    def __init__(self, *, unet, scheduler, p_mask: float = 0.9):
+        # 1) Let base class register the trainable modules
+        super().__init__(unet=unet, scheduler=scheduler)
 
+        # 2) Store hyper‑parameter in the *config* **and** as an attribute
+        self.register_to_config(p_mask=p_mask)   # guarantees serialisation
+        self.p_mask = p_mask                     # convenient runtime access
+        
     @torch.no_grad()
     def __call__(
         self,
         batch_size: int = 1,
-        num_inference_steps: int = 1000,
-        generator=None,
-        output_type: str = "pil",
+        generator: Optional[torch.Generator] = None,
+        num_inference_steps: int = 250,
+        class_labels: Optional[torch.Tensor] = None,
+        guidance_scale: float = 3.0,
+        output_type: str = "pt",
         return_dict: bool = True,
     ):
         device = self.device
@@ -113,13 +119,40 @@ class AmbientDDPMPipeline(DDPMPipeline):
 
         self.scheduler.set_timesteps(num_inference_steps, device=device)
 
+
+        if class_labels is None:
+                cond_lbls = torch.zeros(
+                    (batch_size,
+                    getattr(self.unet.config, "multihot_dim", 1)),
+                    dtype=torch.long if not hasattr(self.unet.config, "multihot_dim") else torch.float,
+                    device=device,
+                )
+        else:
+            cond_lbls = class_labels.to(device)
+
+        uncond_lbls = torch.zeros_like(cond_lbls)
+
         for t in self.scheduler.timesteps:
-            eps = self.unet(mask * x, t).sample         # hθ(˜A, ˜A x_t , t)
-            x0_hat = eps                                # network ≈ x₀
-            γ = self.scheduler.sigmas[t] ** 2 / (
-                self.scheduler.sigmas[t] ** 2 + 1
-            )
-            x = γ * x + (1 - γ) * x0_hat                # Eq. 3.3
+
+            if guidance_scale == 1.0 or class_labels is None:
+                # single unconditional or conditional pass
+                eps = self.unet(mask * x, t, class_labels=cond_lbls).sample
+            else:
+                # duplicate batch: cond | uncond
+                inp  = torch.cat([mask * x, mask * x], dim=0)
+                lbls = torch.cat([cond_lbls, uncond_lbls], dim=0)
+                tids = t.expand(2 * batch_size)
+
+                eps_cond, eps_uncond = (
+                    self.unet(inp, tids, class_labels=lbls).sample.chunk(2)
+                )
+                eps = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
+
+            # ---------- Eq. 3.3 update (must be INSIDE the loop) ----------
+            x0_hat = eps
+            sigma = self.scheduler._get_variance(t).sqrt()
+            gamma = sigma ** 2 / (sigma ** 2 + 1)
+            x = gamma * x + (1 - gamma) * x0_hat
             x = self.scheduler.step(eps, t, x).prev_sample
 
         x = (x / 2 + 0.5).clamp(0, 1)

@@ -290,13 +290,19 @@ def parse_args():
         "--ambient_delta",
         type=float,
         default=0.05,
-        help="Extra drop-prob δ for secondary mask ˜A",
+        help="Extra drop-prob delta for secondary mask ˜A",
     )
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
+    if args.ambient and args.prediction_type != "sample":
+        print(
+            "[Info] --ambient requires prediction_type='sample' "
+            f"(overriding '{args.prediction_type}')."
+        )
+        args.prediction_type = "sample"
 
     return args
 
@@ -590,7 +596,7 @@ def main(args):
 
             if args.ambient:
                 noisy_images, A_mask = make_ambient_batch(
-                    clean_images, noise_scheduler, timesteps
+                    clean_images, noise_scheduler, timesteps, p=args.ambient_p, delta=args.ambient_delta
                 )
             else:
                 noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
@@ -663,10 +669,6 @@ def main(args):
                         timestep=timesteps,
                         class_labels=conditional_input,
                     ).sample
-
-                    if args.ambient:
-                        # Force sampling for ambient diffusion
-                        args.prediction_type = "sample"
 
                     if args.prediction_type == "epsilon":
                         loss = F.mse_loss(
@@ -768,7 +770,7 @@ def main(args):
                     unet=unet,
                     scheduler=noise_scheduler,
                     p_mask=0.9,                 # keep the same masking probability you used in training
-                )
+                ).to(accelerator.device)
                 else:
                     pipeline = ConditionalDDPMPipeline(
                         unet=unet,
@@ -809,6 +811,8 @@ def main(args):
                     batch_size=len(CHEXPERT_CLASSES),
                     num_inference_steps=args.ddpm_num_inference_steps,
                     output_type="np",
+                    class_labels=class_labels,
+                    guidance_scale=1.0,
                     )
                 else:
                     result = pipeline(

@@ -57,7 +57,7 @@ echo "Starting training at $(date)"
 echo "Command: python3 train_cfg_diffusion.py --batch_size 4"
 
 # Run training
-python conditional_ddpm_train_v2.py   --data_dir /dtu/blackhole/1d/214141/CheXpert-v1.0-small   --output_dir /dtu/blackhole/1d/214141/chest_xray_diffusion   --resolution 128  --train_batch_size 2  --num_epochs 100   --dataloader_num_workers 4   --learning_rate 1e-4   --use_ema   --mixed_precision no --debug_mode --ambient
+python conditional_ddpm_train_v2.py   --data_dir /dtu/blackhole/1d/214141/CheXpert-v1.0-small   --output_dir /dtu/blackhole/1d/214141/chest_xray_diffusion/ambient   --resolution 128  --train_batch_size 2  --num_epochs 100   --dataloader_num_workers 4   --learning_rate 1e-4   --use_ema   --mixed_precision no --debug_mode --ambient
 
 ### -- Job cleanup and information --
 echo "Training finished at $(date)"
