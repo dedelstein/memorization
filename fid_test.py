@@ -20,7 +20,7 @@ BATCH = 32                 # any value that fits on GPU
 IMG_SIZE = 224             # must match the generator
 GUIDE   = 1.5        # or sweep multiple values
 STEPS   = 20
-TOTAL   = 5_0      # number of images you want in FID
+TOTAL   = 5_000      # number of images you want in FID
 
 model_path = "checkpoint-31000"
 #metric_device = torch.device("cpu")
