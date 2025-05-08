@@ -46,11 +46,23 @@ pipe.unet.eval()
 
 device  = pipe.device
 
+label_bank = torch.tensor(
+    real_ds.data_frame[real_ds.classes].values,
+    dtype=torch.float32,
+    device=device,
+    requires_grad=False
+)
+
+def sample_real_labels(batch_size: int) -> torch.Tensor:
+    """Randomly pick `batch_size` rows from the validation label bank."""
+    idx = torch.randint(0, label_bank.size(0), (batch_size,), device=device)
+    return label_bank[idx]
+
 def gen_loader():
     n_batches = math.ceil(TOTAL / BATCH)
     for _ in range(n_batches):
         # sample random multi-hot label vectors with the same dimension as CheXpert
-        labels = torch.bernoulli(torch.full((BATCH, 14), 0.15, device=device))
+        labels = sample_real_labels(BATCH)
         out = pipe(
             batch_size=BATCH,
             num_inference_steps=STEPS,
@@ -115,14 +127,14 @@ class XRAYFID(Metric):
 
 class AnatomicalFID(Metric):
     """
-    Anatomical‐accuracy FID that needs *no extra training*.
+    Anatomical-accuracy FID that needs *no extra training*.
 
     It feeds each image through the frozen TorchXRayVision PSPNet,
-    keeps the per‑class probability maps, spatially pools them to a
-    fixed grid (8 × 8 by default) and runs standard FID on the resulting
+    keeps the per-class probability maps, spatially pools them to a
+    fixed grid (8 x 8 by default) and runs standard FID on the resulting
     vectors.  The pooled maps encode organ size, position *and* coarse
     shape, giving a far richer signal than the old
-    (area + centroid) triple.
+    (area + centroid) triple.
     """
 
     full_state_update = False          # required by torchmetrics ≥0.11
@@ -133,6 +145,7 @@ class AnatomicalFID(Metric):
         self.add_state("real_feats",  default=[], dist_reduce_fx=None)
         self.add_state("fake_feats",  default=[], dist_reduce_fx=None)
         self.add_state("fake_imgs",   default=[], dist_reduce_fx=None)
+        self.add_state("real_imgs",   default=[], dist_reduce_fx=None)
 
 
     # ------------------------------------------------------------------
@@ -143,13 +156,13 @@ class AnatomicalFID(Metric):
         """
         Parameters
         ----------
-        imgs : float tensor in **[-1, 1]**, shape *(B, 1, H, W)*
+        imgs : float tensor in **[-1, 1]**, shape *(B, 1, H, W)*
 
         Returns
         -------
-        feats : float tensor, shape *(B, C × pool_size²)*
+        feats : float tensor, shape *(B, C x pool_size²)*
         """
-        # PSPNet expects HU‑like range [‑1024, 1024]
+        # PSPNet expects HU-like range [-1024, 1024]
         imgs = imgs[:, :1].to(device)
         imgs = ((imgs + 1.0) * 0.5) * 2048.0 - 1024.0
         imgs = torch.nn.functional.interpolate(
@@ -157,24 +170,27 @@ class AnatomicalFID(Metric):
         )
 
         # Forward through the frozen segmenter
-        logits = SEG_MODEL(imgs)                      # [B, C, H, W]
+        logits = SEG_MODEL(imgs)                      # [B, C, H, W]
         probs  = torch.softmax(logits, dim=1)
 
         # Pool to a fixed grid and flatten
         pooled = torch.nn.functional.adaptive_avg_pool2d(
-            probs, self.pool_size                    # [B, C, p, p]
+            probs, self.pool_size                    # [B, C, p, p]
         )
-        feats = pooled.flatten(1)                    # [B, C·p²]
+        feats = pooled.flatten(1)                    # [B, C·p²]
 
         return feats if metric_device.type == device.type else feats.to(metric_device)
 
     # ------------------------------------------------------------------
-    #  Book‑keeping
+    #  Book-keeping
     # ------------------------------------------------------------------
     def update(self, imgs: torch.Tensor, *, real: bool) -> None:
         feats = self._encode(imgs)
-        (self.real_feats if real else self.fake_feats).append(feats)
-        if not real:                         # keep a lightweight copy for vis
+        if real:
+            self.real_feats.append(feats)
+            self.real_imgs.extend(imgs.cpu())        # NEW
+        else:
+            self.fake_feats.append(feats)
             self.fake_imgs.extend(imgs.cpu())
 
 
@@ -215,12 +231,14 @@ with tqdm(total=n_real + n_fake, unit="batch") as pbar:
         anat_fid.update(imgs, real=True) 
         if i == 0:                      # keep only the very first batch
             preview_real = imgs[:16]    # 4×4 grid; adjust if batch < 16
+        pbar.update(1)
 
     for i, imgs in enumerate(gen_loader()):
         chex_fid.update(imgs, real=False)
         anat_fid.update(imgs, real=False) 
         if i == 0:
             preview_fake = imgs[:16]
+        pbar.update(1)
 
 print("Anatomical FID =", anat_fid.compute().item())
 print("CheX-FID =", chex_fid.compute().item())
@@ -241,7 +259,8 @@ save_grid(preview_real, "preview_real.png", "Real CheXpert (val)")
 save_grid(preview_fake, "preview_fake.png", "Generated (guidance=%.2f)" % GUIDE)
 print("Saved comparison grids → preview_real.png  /  preview_fake.png")
 
-K = 12                     # how many outliers to display
+K_REAL = 6
+K_FAKE = 6                     # how many outliers to display
 OUT_PATH = "anat_outliers.png"
 COLORS = [(0,255,0), (255,0,0), (0,0,255), (255,255,0),
           (0,255,255), (255,0,255), (192,128,0), (0,128,192),
@@ -253,14 +272,17 @@ real_feats = torch.cat(anat_fid.real_feats).double()
 fake_feats = torch.cat(anat_fid.fake_feats).double()
 mu_r   = real_feats.mean(0, keepdim=True)             # (1,C)
 Sigma  = (torch.cov(real_feats.T) + 1e-6 * torch.eye(real_feats.shape[1], device=real_feats.device))
-# pre‑compute Σ⁻¹ once
+# pre-compute Σ⁻¹ once
 Sigma_inv = torch.linalg.inv(Sigma)
 
-# d^2 = (z‑μ)^T Σ⁻¹ (z‑μ)
-diff     = fake_feats - mu_r
-maha_sq  = (diff @ Sigma_inv * diff).sum(1)           # (N,)
+# d^2 = (z-μ)^T Σ⁻¹ (z-μ)
+diff_fake  = fake_feats - mu_r
+maha_sq_fake  = (diff_fake @ Sigma_inv * diff_fake).sum(1)
+topk_fake = torch.topk(maha_sq_fake, k=min(K_FAKE, maha_sq_fake.numel())).indices
 
-topk_idx = torch.topk(maha_sq, k=min(K, maha_sq.numel()))[1]
+diff_real  = real_feats - mu_r
+maha_sq_real = (diff_real @ Sigma_inv * diff_real).sum(1)
+topk_real = torch.topk(maha_sq_real, k=min(K_REAL, maha_sq_real.numel())).indices
 
 # --- 2. Build overlay images -------------------------------------
 grid_imgs = []
@@ -268,8 +290,8 @@ SEG_MODEL.eval()                                      # ensure inference mode
 CLASS_NAMES = SEG_MODEL.targets
 
 with torch.no_grad():
-    for idx in topk_idx:
-        img = anat_fid.fake_imgs[idx].to(device)      # keep a copy earlier
+    for idx in topk_real:
+        img = anat_fid.real_imgs[idx].to(device)
         img_gray = ((img.cpu()*0.5+0.5)*255).clamp_(0,255)[0].to(torch.uint8).numpy()
         vis = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2BGR)
 
@@ -281,7 +303,7 @@ with torch.no_grad():
         probs = logits.softmax(0)                       # (C,H,W)
         conf, cls = probs.max(0)                        # (H,W)
         mask  = torch.zeros_like(probs, dtype=torch.bool)
-        mask.scatter_(0, cls.unsqueeze(0), (conf > 0.6).unsqueeze(0))  # high‑confidence pixels
+        mask.scatter_(0, cls.unsqueeze(0), (conf > 0.6).unsqueeze(0))  # high-confidence pixels
 
         # keep only largest blob per class
         mask_np = mask.cpu().numpy()
@@ -298,13 +320,60 @@ with torch.no_grad():
                     mode="nearest")[0].bool()                          # (C,H,W)
         mask_np = mask.cpu().numpy().astype(np.uint8)                  # NumPy!
 
-        # --------  overlay: filled alpha + 2‑px contour  ---------------
+        # --------  overlay: filled alpha + 2-px contour  ---------------
         alpha   = 0.1
         overlay = vis.copy()
         for c, col in enumerate(COLORS):
 
             cls_name = SEG_MODEL.targets[c]
-            color    = tuple(int(x) for x in col)             # BGR 0‑255
+            color    = tuple(int(x) for x in col)             # BGR 0-255
+            m        = mask_np[c]                             # (H,W) uint8
+
+            pix = int(m.sum())                                # how many pixels?
+            if pix:                                           # skip empty
+                overlay[m.astype(bool)] = color               # filled label
+                
+        vis = cv2.addWeighted(overlay, alpha, vis, 1-alpha, 0)
+
+        grid_imgs.append(torch.from_numpy(vis).permute(2,0,1))
+
+    for idx in topk_fake:
+        img = anat_fid.fake_imgs[idx].to(device)
+        img_gray = ((img.cpu()*0.5+0.5)*255).clamp_(0,255)[0].to(torch.uint8).numpy()
+        vis = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2BGR)
+
+        # ── segment ───────────────────────────────────────────────
+        logits = SEG_MODEL(torch.nn.functional.interpolate(
+                ((img+1)*0.5*2048-1024).unsqueeze(0), 512,
+                mode="bilinear", align_corners=False))[0] # (C,H,W)
+
+        probs = logits.softmax(0)                       # (C,H,W)
+        conf, cls = probs.max(0)                        # (H,W)
+        mask  = torch.zeros_like(probs, dtype=torch.bool)
+        mask.scatter_(0, cls.unsqueeze(0), (conf > 0.6).unsqueeze(0))  # high-confidence pixels
+
+        # keep only largest blob per class
+        mask_np = mask.cpu().numpy()
+        clean = np.zeros_like(mask_np)
+        for c in range(mask_np.shape[0]):
+            cnt, lab = cv2.connectedComponents(mask_np[c].astype('uint8'))
+            if cnt > 1:
+                sizes = np.bincount(lab.flat)[1:]
+                clean[c] = lab == (1 + sizes.argmax())
+        mask = torch.from_numpy(clean)
+        h, w = vis.shape[:2]                                           # 224,224
+        mask = torch.nn.functional.interpolate(
+                    mask.unsqueeze(0).float(), size=(h, w),
+                    mode="nearest")[0].bool()                          # (C,H,W)
+        mask_np = mask.cpu().numpy().astype(np.uint8)                  # NumPy!
+
+        # --------  overlay: filled alpha + 2-px contour  ---------------
+        alpha   = 0.1
+        overlay = vis.copy()
+        for c, col in enumerate(COLORS):
+
+            cls_name = SEG_MODEL.targets[c]
+            color    = tuple(int(x) for x in col)             # BGR 0-255
             m        = mask_np[c]                             # (H,W) uint8
 
             pix = int(m.sum())                                # how many pixels?
@@ -339,8 +408,19 @@ def build_legend(class_names, colors, height=24, pad=6):
 
 # --- 3. Save grid -------------------------------------------------
 if grid_imgs:
-    # ---------- 3×4 grid of worst‑K images ----------
-    grid = make_grid(grid_imgs, nrow=4, padding=2, value_range=(0, 255))
+    # ---------- 3×4 grid of worst-K images ----------z
+    #grid = make_grid(grid_imgs, nrow=4, padding=2, value_range=(0, 255))
+    ref_h, ref_w = grid_imgs[0].shape[-2:]
+    grid_imgs = [
+        F.interpolate(img.unsqueeze(0),
+                      size=(ref_h, ref_w),
+                      mode="bilinear",
+                      align_corners=False
+        ).squeeze(0) if img.shape[-2:] != (ref_h, ref_w) else img
+        for img in grid_imgs
+    ]
+
+    grid = make_grid(grid_imgs, nrow=6, padding=2, value_range=(0, 255))
     grid_img = (grid / 255.0).permute(1, 2, 0).cpu().numpy() * 255   # H×W×3 uint8
 
     # ---------- build legend strip (title + coloured rows) ----------

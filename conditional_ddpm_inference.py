@@ -94,6 +94,8 @@ def load_model(model_path, ambient=False):
             print(f"Trying to load UNet directly from {model_path}")
             unet = CustomClassConditionedUnet.from_pretrained(model_path)
         
+        pred_type = "sample" if ambient else "epsilon"
+
         # Cargar scheduler
         scheduler_path = os.path.join(model_path, "scheduler")
         if os.path.exists(scheduler_path):
@@ -105,7 +107,7 @@ def load_model(model_path, ambient=False):
             scheduler = DDPMScheduler(
                 num_train_timesteps=1000,
                 beta_schedule="linear",
-                prediction_type="epsilon",
+                prediction_type=pred_type,
             )
         
         # Crear pipeline manualmente
@@ -152,10 +154,11 @@ def load_model(model_path, ambient=False):
                             break
             
             # Crear scheduler
+
             scheduler = DDPMScheduler(
                 num_train_timesteps=1000,
                 beta_schedule="linear",
-                prediction_type="epsilon",
+                prediction_type=pred_type,
             )
             
             # Crear pipeline

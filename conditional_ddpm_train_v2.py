@@ -290,7 +290,14 @@ def parse_args():
         "--ambient_delta",
         type=float,
         default=0.05,
-        help="Extra drop-prob delta for secondary mask ˜A",
+        help="Extra drop-prob delta for secondary mask ~A",
+    )
+
+    parser.add_argument(
+        "--guidance_scale",
+        type=float,
+        default=1.0,
+        help="Guidance Scale for CFG",
     )
 
     args = parser.parse_args()
