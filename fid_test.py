@@ -482,3 +482,54 @@ if grid_imgs:
     print(f"Saved anatomical outlier grid →  {OUT_PATH}")
 else:
     print("No fake images were collected for outlier vis.")
+
+import torch
+from torch.utils.data import Subset, DataLoader
+from copy import deepcopy                                       # no new deps
+
+# ---------- 1. real vs real ----------------------------------------
+torch.manual_seed(0)                                            # reproducible
+perm = torch.randperm(len(real_ds))
+mid  = len(perm) // 2
+split_A = Subset(real_ds, perm[:mid])
+split_B = Subset(real_ds, perm[mid:])
+
+ldr_A = DataLoader(split_A, batch_size=BATCH, shuffle=False,
+                   num_workers=8, pin_memory=True)
+ldr_B = DataLoader(split_B, batch_size=BATCH, shuffle=False,
+                   num_workers=8, pin_memory=True)
+
+chex_rr  = XRAYFID().to(metric_device)
+anat_rr  = AnatomicalFID().to(metric_device)
+
+with torch.no_grad():
+    for batch in ldr_A:                         # first half → “real”
+        imgs = batch["image"].to(device)
+        chex_rr.update(imgs, real=True)
+        anat_rr.update(imgs, real=True)
+
+    for batch in ldr_B:                         # second half → “fake”
+        imgs = batch["image"].to(device)
+        chex_rr.update(imgs, real=False)
+        anat_rr.update(imgs, real=False)
+
+print(f"\nXRAY-FID  real↔real  : {chex_rr.compute().item():.4f}")
+print(f"Anatomy-FID real↔real : {anat_rr.compute().item():.4f}")
+
+# ---------- 2. real vs white-noise ---------------------------------
+chex_rn  = XRAYFID().to(metric_device)
+anat_rn  = AnatomicalFID().to(metric_device)
+
+with torch.no_grad():
+    for batch in ldr_A:                         # reuse first split as “real”
+        imgs = batch["image"].to(device)
+        chex_rn.update(imgs, real=True)
+        anat_rn.update(imgs, real=True)
+
+        # create matching noise batch in [-1, 1]
+        noise = torch.randn_like(imgs).clamp_(-1, 1)
+        chex_rn.update(noise, real=False)
+        anat_rn.update(noise, real=False)
+
+print(f"XRAY-FID  real↔noise : {chex_rn.compute().item():.4f}")
+print(f"Anatomy-FID real↔noise: {anat_rn.compute().item():.4f}")

@@ -396,9 +396,17 @@ def main(args):
             os.makedirs(args.output_dir, exist_ok=True)
 
     # Initialize the model
-    model = CustomClassConditionedUnet(
+    
+    if args.ambient:
+        model = CustomClassConditionedUnet(
+        sample_size=args.resolution,
+        in_channels=2
+        )
+    else:
+        model = CustomClassConditionedUnet(
         sample_size=args.resolution,
     )
+
 
     # Create EMA for the model.
     if args.use_ema:
@@ -602,7 +610,7 @@ def main(args):
             ).long()
 
             if args.ambient:
-                noisy_images, A_mask = make_ambient_batch(
+                model_input, A_mask = make_ambient_batch(
                     clean_images, noise_scheduler, timesteps, p=args.ambient_p, delta=args.ambient_delta
                 )
             else:
@@ -671,11 +679,17 @@ def main(args):
 
                 else:
                     # Predict the noise residual
-                    model_output = model(
-                        sample=noisy_images,
-                        timestep=timesteps,
-                        class_labels=conditional_input,
-                    ).sample
+                    if args.ambient:
+                        model_output = model(sample=model_input,
+                                             timestep=timesteps, 
+                                             class_labels=conditional_input,
+                                            ).sample
+                    else:
+                        model_output = model(
+                            sample=noisy_images,
+                            timestep=timesteps,
+                            class_labels=conditional_input,
+                        ).sample
 
                     if args.prediction_type == "epsilon":
                         loss = F.mse_loss(
@@ -691,11 +705,17 @@ def main(args):
                         snr_weights = alpha_t / (1 - alpha_t + 1e-8)
                         # use SNR weighting from distillation paper
                         if args.ambient:
-                            loss = ambient_loss(
-                                model_output,
-                                clean_images,
-                                A_mask,
+                            alpha_t = _extract_into_tensor(
+                                noise_scheduler.alphas_cumprod,
+                                timesteps,
+                                (clean_images.shape[0], 1, 1, 1),
                             )
+                            snr_w = alpha_t / (1 - alpha_t + 1e-8)
+                            loss = ambient_loss(model_output,
+                                                clean_images,
+                                                A_mask,
+                                                snr_weights=snr_w)
+
                         else:
                             loss = snr_weights * F.mse_loss(
                                 model_output.float(),

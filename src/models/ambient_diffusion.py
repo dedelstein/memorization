@@ -27,10 +27,8 @@ def sample_inpainting_mask(
     device: torch.device | str | None = None,
 ) -> Tensor:
     """Diagonal Bernoulli mask A: 1 = keep, 0 = erase."""
-    B, _, H, W = shape
-    return torch.bernoulli(
-        torch.full((B, 1, H, W), 1.0 - p, device=device)
-    )
+    B, C, H, W = shape
+    return torch.bernoulli(torch.full((B, 1, H, W), p, device=device)).expand(-1, C, -1, -1)
 
 
 def further_corrupt(A: Tensor, delta: float = 0.05) -> Tensor:
@@ -62,20 +60,29 @@ def make_ambient_batch(
 
     # 2.  add diffusion noise → x_t , then A x_t
     noise   = torch.randn_like(clean)
-    x_t     = noise_scheduler.add_noise(clean, noise, timesteps)
+
+    if timesteps.ndim == 0:
+        timesteps = torch.full((B,), timesteps, device=device, dtype=torch.long)
+    elif timesteps.shape[0] != B:
+        raise ValueError(f"Timesteps batch size {timesteps.shape[0]} does not match input batch size {B}")
+    
+    x_t = noise_scheduler.add_noise(clean, noise, timesteps)
 
     # 3.  ~A x_t
-    A_tilde = further_corrupt(A, delta=delta)
-    y_t_tilde = A_tilde * x_t
+    A_tilde     = further_corrupt(A, delta=delta)
+    mask_ch     = A_tilde[:, :1]                       # (B,1,H,W)
+    net_input   = torch.cat([A_tilde * x_t, mask_ch], dim=1)
+    return net_input, A
 
-    return y_t_tilde, A
-
-
-def ambient_loss(pred: Tensor, clean: Tensor, A_mask: Tensor) -> Tensor:
-    """MSE on observable pixels only."""
+def ambient_loss(pred, clean, A_mask, snr_weights=None):
+    """
+    Masked L2 loss with optional SNR weights (Eq. 2 in the paper).
+    """
     diff = A_mask * (pred - clean)
-    return 0.5 * diff.pow(2).mean()
-
+    loss = 0.5 * diff.pow(2)
+    if snr_weights is not None:
+        loss = snr_weights * loss
+    return loss.mean()
 # ------------------------------------------------------------------
 # Sampler
 # ------------------------------------------------------------------
@@ -112,7 +119,7 @@ class AmbientDDPMPipeline(DDPMPipeline):
         )
 
         x = torch.randn(
-            (batch_size, self.unet.config.in_channels, h, w),
+            (batch_size, 1, h, w),
             generator=generator,
             device=device,
         )
@@ -135,11 +142,13 @@ class AmbientDDPMPipeline(DDPMPipeline):
         for t in self.scheduler.timesteps:
 
             if guidance_scale == 1.0 or class_labels is None:
-                # single unconditional or conditional pass
-                eps = self.unet(mask * x, t, class_labels=cond_lbls).sample
+                # single unconditional (or conditional) pass
+                net_inp = torch.cat([mask * x, mask[:, :1]], dim=1)
+                eps = self.unet(net_inp, t, class_labels=cond_lbls).sample
             else:
                 # duplicate batch: cond | uncond
-                inp  = torch.cat([mask * x, mask * x], dim=0)
+                net_inp = torch.cat([mask * x, mask[:, :1]], dim=1)  # (B,C+1,H,W)
+                inp     = torch.cat([net_inp, net_inp], dim=0)       # (2B,C+1,H,W)
                 lbls = torch.cat([cond_lbls, uncond_lbls], dim=0)
                 tids = t.expand(2 * batch_size)
 
