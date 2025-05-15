@@ -256,8 +256,22 @@ def parse_args():
         action="store_true",
         help="Use pin_memory for faster data transfer to GPU",
     )
+    
     parser.add_argument(
         "--seed", type=int, default=42, help="Random seed for initialization"
+    )
+    
+    parser.add_argument(
+        "--data_size",
+        type=int,
+        default=5000,
+        help="Data size for training",
+    )
+    
+    parser.add_argument(
+        "--overfit",
+        action="store_true",
+        help="Wheter to use extremly small data subset to cerainly overfit",
     )
 
     args = parser.parse_args()
@@ -411,7 +425,7 @@ def main(args):
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
-        eps=args.adam_epsilon,
+        eps=args.adam_epsilon
     )
 
     # Initialize the CheXpert DataModule
@@ -422,7 +436,9 @@ def main(args):
         num_workers=args.dataloader_num_workers,
         seed=args.seed,
         debug_mode=args.debug_mode,
-        pin_memory=args.pin_memory,
+        overfit=args.overfit,
+        data_size=args.data_size,
+        pin_memory=args.pin_memory
     )
 
     # Prepare the data

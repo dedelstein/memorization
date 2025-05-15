@@ -22,10 +22,12 @@ class CheXpertDataModule(pl.LightningDataModule):
         img_size=224,
         batch_size=16,
         num_workers=4,
+        data_size: int = 5000,
+        overfit: bool = False,
         seed=42,
         debug_mode=False,
         pin_memory=True,
-        class_index=None,
+        class_index=None
     ):
         super().__init__()
         self.data_dir = data_dir
@@ -36,6 +38,8 @@ class CheXpertDataModule(pl.LightningDataModule):
         self.debug_mode = debug_mode
         self.pin_memory = pin_memory
         self.class_index = class_index
+        self.data_size = data_size
+        self.overfit = overfit
 
         # No transform as preprocessing happens in the dataset class
         self.transform = None
@@ -64,6 +68,8 @@ class CheXpertDataModule(pl.LightningDataModule):
                 base_dir=self.data_dir,
                 transform=self.transform,
                 debug_mode=self.debug_mode,
+                overfit=self.overfit,
+                data_size=self.data_size,
                 class_index=self.class_index,
                 img_size=self.img_size,
             )
@@ -73,6 +79,8 @@ class CheXpertDataModule(pl.LightningDataModule):
                 base_dir=self.data_dir,
                 transform=self.transform,
                 debug_mode=self.debug_mode,
+                overfit=self.overfit,
+                data_size=self.data_size,
                 class_index=self.class_index,
                 img_size=self.img_size,
             )

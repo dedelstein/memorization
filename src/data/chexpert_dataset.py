@@ -24,8 +24,10 @@ class CheXpertDataset(Dataset):
         base_dir: str,
         transform: transforms.Compose = None,
         debug_mode: bool = False,
+        data_size: int = 5000,
+        overfit: bool = False,
         class_index: list = None,
-        img_size=224,
+        img_size=224
     ):
         """
         Args:
@@ -51,6 +53,8 @@ class CheXpertDataset(Dataset):
         self.data_frame = self._preprocess_dataset(
             df,
             debug_mode=debug_mode,
+            data_size = data_size,
+            overfit = overfit
         )
 
         # Set up class variables
@@ -59,7 +63,7 @@ class CheXpertDataset(Dataset):
         self.img_size = img_size
 
     def _preprocess_dataset(
-        self, df, filter_frontal_ap=True, fill_na=True, debug_mode=False
+        self, df, filter_frontal_ap=True, fill_na=True, debug_mode=False, data_size = 5000, overfit = False
     ):
         """
         Preprocess the CheXpert dataset.
@@ -84,10 +88,15 @@ class CheXpertDataset(Dataset):
         # Select only necessary columns
         filtered_df = df[["Path"] + self.classes]
 
-        # Debug mode to use a small subset
-        if debug_mode:
+        # Debug mode to use a small subset # 1280
+        
+        if overfit:
+            filtered_df = filtered_df.iloc[-min(60, len(filtered_df)):]
+        elif debug_mode:
             filtered_df = filtered_df.iloc[: min(5000, len(filtered_df))]
-
+        else:
+            filtered_df = filtered_df.sample(frac=1, random_state=42).iloc[: min(data_size, len(filtered_df))]
+            
         # Return the processed dataframe
         return filtered_df
 
