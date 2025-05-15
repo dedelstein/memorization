@@ -1,7 +1,7 @@
 #!/bin/sh 
 ### General options 
 ### -- specify queue -- 
-#BSUB -q gpuv100
+#BSUB -q gpua100
 ### -- set the job Name -- 
 #BSUB -J DDPM
 ### -- ask for number of cores (default: 1) -- 
@@ -25,5 +25,5 @@ source venv/bin/activate
 
 export HF_HOME="/work3/s243891"
 
-python3 conditional_ddpm_train_v2.py --overfit --data_dir /dtu/blackhole/1d/214141/CheXpert-v1.0-small   --output_dir /work3/s243891/chest_xray_diffusion_overfit  --resolution 128   --train_batch_size 4  --num_epochs 300   --dataloader_num_workers 4   --learning_rate 1e-4   --use_ema   --mixed_precision fp16 --resume_from_checkpoint latest
+python3 conditional_ddpm_train_v2.py --overfit --data_dir /dtu/blackhole/1d/214141/CheXpert-v1.0-small   --output_dir /work3/s243891/chest_xray_diffusion_overfit_A  --resolution 128   --train_batch_size 4  --num_epochs 30000   --dataloader_num_workers 4   --learning_rate 1e-4   --use_ema   --mixed_precision fp16 --resume_from_checkpoint latest --checkpointing_steps 10000
 # python3 conditional_ddpm_train_v2.py --overfit --data_dir /dtu/blackhole/1d/214141/CheXpert-v1.0-small   --output_dir /work3/s243891/chest_xray_diffusion  --resolution 128   --train_batch_size 4  --num_epochs 300   --dataloader_num_workers 4   --learning_rate 1e-4   --use_ema   --mixed_precision fp16 --resume_from_checkpoint latest

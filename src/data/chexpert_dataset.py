@@ -91,7 +91,7 @@ class CheXpertDataset(Dataset):
         # Debug mode to use a small subset # 1280
         
         if overfit:
-            filtered_df = filtered_df.iloc[-min(60, len(filtered_df)):]
+            filtered_df = filtered_df.iloc[-min(100, len(filtered_df)):]
         elif debug_mode:
             filtered_df = filtered_df.iloc[: min(5000, len(filtered_df))]
         else:
