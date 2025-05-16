@@ -196,3 +196,5 @@ cft_classifier/optimized_model.h5
 .neptune/
 .vscode/launch.json
 chest_xray_diffusion_imgs
+cfg_samples*
+metrics*
