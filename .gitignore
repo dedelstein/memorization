@@ -196,3 +196,5 @@ cft_classifier/optimized_model.h5
 *.neptune/
 .neptune/
 .vscode/launch.json
+cfg_samples*
+*.npy
