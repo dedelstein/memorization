@@ -1,7 +1,7 @@
 #!/bin/sh 
 ### General options 
 ### -- specify queue -- 
-#BSUB -q gpuv100
+#BSUB -q a10
 ### -- set the job Name -- 
 #BSUB -J DDPM
 ### -- ask for number of cores (default: 1) -- 

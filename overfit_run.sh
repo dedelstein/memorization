@@ -1,7 +1,7 @@
 #!/bin/sh 
 ### General options 
 ### -- specify queue -- 
-#BSUB -q gpua100
+#BSUB -q gpuv100
 ### -- set the job Name -- 
 #BSUB -J DDPM
 ### -- ask for number of cores (default: 1) -- 
@@ -14,7 +14,7 @@
 ### -- specify that we want the job to get killed if it exceeds 5 GB per core/slot -- 
 #BSUB -M 5GB
 ### -- set walltime limit: hh:mm -- 
-#BSUB -W 23:00 
+#BSUB -W 1:00 
 ### -- Specify the output and error file. %J is the job-id -- 
 #BSUB -o OVERFITDDPM_%J.out
 #BSUB -e OVERFITDDPM_%J.err
