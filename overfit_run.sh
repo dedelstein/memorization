@@ -3,7 +3,7 @@
 ### -- specify queue -- 
 #BSUB -q gpuv100
 ### -- set the job Name -- 
-#BSUB -J DDPM
+#BSUB -J OverfitDDPM
 ### -- ask for number of cores (default: 1) -- 
 #BSUB -n 4 
 #BSUB -gpu "num=1:mode=exclusive_process"
