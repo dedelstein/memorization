@@ -4,12 +4,11 @@ CheXpert-v1.0-small/train/*
 CheXpert-v1.0-small/valid/*
 cft_classifier
 README_copy.md
-checkpoints/
-logs/
 cft_classifier/
 progress_samples_*
-
 path_to_dataset.txt
+generated_images/
+chest_xray_diffusion/
 
 
 # Byte-compiled / optimized / DLL files
