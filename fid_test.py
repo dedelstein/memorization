@@ -10,19 +10,100 @@ from src.data.chexpert_dataset import CheXpertDataset
 from src.models.conditional_ddpm_pipeline import ConditionalDDPMPipeline
 from torchmetrics.image.fid import _compute_fid
 from torchmetrics import Metric
-from conditional_ddpm_inference import load_model
 import torch.nn.functional as F
 from tqdm.auto import tqdm
 import matplotlib.pyplot as plt
 from torchvision.utils import make_grid
 
-BATCH = 32                 # any value that fits on GPU
-IMG_SIZE = 224             # must match the generator
-GUIDE   = 1.5        # or sweep multiple values
-STEPS   = 20
-TOTAL   = 5_000      # number of images you want in FID
+from pathlib import Path
+from diffusers import DDPMScheduler
+from src.models.cfg_diffusion import CustomClassConditionedUnet
+from src.models.conditional_ddpm_pipeline import ConditionalDDPMPipeline
+from src.models.ambient_diffusion import AmbientDDPMPipeline
 
-model_path = "checkpoint-31000"
+def load_model(model_path: str, ambient: bool = False, device: torch.device | None = None):
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model_path = Path(model_path)
+
+    # ─── 1. New format – full pipeline folder ──────────────────────────────
+    if (model_path / "model_index.json").is_file():
+        pipe_cls = AmbientDDPMPipeline if ambient else ConditionalDDPMPipeline
+        try:
+            print(f"Attempting to load full pipeline {pipe_cls.__name__} from {model_path}")
+            pipe = pipe_cls.from_pretrained(model_path)
+            print("Successfully loaded full pipeline.")
+            return pipe.to(device)
+        except ValueError as e:
+            if "cannot be loaded as it does not seem to have any of the loading methods" in str(e):
+                print(f"Pipeline loading failed with ValueError: {e}. Attempting to fall back to manual component loading.")
+            else:
+                raise e # Re-raise other ValueErrors
+        except Exception as e: # Catch other potential errors during pipeline loading like the type annotation one
+            print(f"Pipeline loading failed with an unexpected error: {e}. Attempting to fall back to manual component loading.")
+            # Fall through to manual loading
+
+    # ─── 2. Old format / Fallback – raw training checkpoint ──────────────────
+    print("Proceeding with manual component loading (either as fallback or primary method).")
+
+    # Correctly load UNet from its subfolder "unet"
+    unet_folder_path = model_path / "unet"
+    if not (unet_folder_path.is_dir() and (unet_folder_path / "config.json").is_file()):
+        # Try "custom_unet_ema" or "custom_unet" as per original script's old format handling
+        if (model_path / "custom_unet_ema").is_dir() and (model_path / "custom_unet_ema" / "config.json").is_file():
+            unet_folder_path = model_path
+            unet_subfolder_name = "custom_unet_ema"
+            print(f"Loading UNet from {unet_folder_path} with subfolder '{unet_subfolder_name}'")
+            unet = CustomClassConditionedUnet.from_pretrained(unet_folder_path, subfolder=unet_subfolder_name)
+        elif (model_path / "custom_unet").is_dir() and (model_path / "custom_unet" / "config.json").is_file():
+            unet_folder_path = model_path
+            unet_subfolder_name = "custom_unet"
+            print(f"Loading UNet from {unet_folder_path} with subfolder '{unet_subfolder_name}'")
+            unet = CustomClassConditionedUnet.from_pretrained(unet_folder_path, subfolder=unet_subfolder_name)
+        else:
+            raise OSError(f"UNet config.json not found in expected locations: {unet_folder_path}, "
+                          f"{model_path / 'custom_unet_ema'}, or {model_path / 'custom_unet'}")
+    else:
+        print(f"Loading UNet from {unet_folder_path}")
+        unet = CustomClassConditionedUnet.from_pretrained(unet_folder_path)
+
+
+    # Correctly load Scheduler from its subfolder "scheduler"
+    pred_type = "sample" if ambient else "epsilon"
+    scheduler_folder_path = model_path / "scheduler"
+    if not (scheduler_folder_path.is_dir() and (scheduler_folder_path / "scheduler_config.json").is_file()):
+        print(f"Scheduler config not found at {scheduler_folder_path}. Creating default DDPMScheduler.")
+        scheduler = DDPMScheduler(
+            num_train_timesteps=1000,
+            beta_schedule="linear",
+            prediction_type=pred_type,
+        )
+    else:
+        print(f"Loading scheduler from {scheduler_folder_path}")
+        scheduler = DDPMScheduler.from_pretrained(scheduler_folder_path)
+    
+    pipe_cls_manual = AmbientDDPMPipeline if ambient else ConditionalDDPMPipeline
+    print(f"Manually instantiating pipeline of type: {pipe_cls_manual.__name__}")
+    
+    if ambient:
+        # For AmbientDDPMPipeline, p_mask is required.
+        # The training script uses args.ambient_p, which defaults to 0.9.
+        # This parameter is part of the pipeline's config, not the UNet's.
+        # We'll use the default from the AmbientDDPMPipeline class definition if possible,
+        # or a common default like 0.9.
+        # inspect.signature(pipe_cls_manual).parameters['p_mask'].default
+        p_mask_val = 0.75 # Defaulting to 0.9 as used in training scripts for Ambient
+        print(f"Using p_mask={p_mask_val} for AmbientDDPMPipeline (manual construction default)")
+        return pipe_cls_manual(unet=unet, scheduler=scheduler, p_mask=p_mask_val).to(device)
+    else:
+        return pipe_cls_manual(unet=unet, scheduler=scheduler).to(device)
+
+BATCH = 32           # any value that fits on GPU
+IMG_SIZE = 224       # must match the generator
+GUIDE   = 1.5
+STEPS   = 20
+TOTAL   = 5_00      # number of images you want in FID
+
+model_path = "/zhome/91/9/214141/ADV_CV/mem_new/memorization/checkpoint-145000"
 #metric_device = torch.device("cpu")
 metric_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -482,54 +563,3 @@ if grid_imgs:
     print(f"Saved anatomical outlier grid →  {OUT_PATH}")
 else:
     print("No fake images were collected for outlier vis.")
-
-import torch
-from torch.utils.data import Subset, DataLoader
-from copy import deepcopy                                       # no new deps
-
-# ---------- 1. real vs real ----------------------------------------
-torch.manual_seed(0)                                            # reproducible
-perm = torch.randperm(len(real_ds))
-mid  = len(perm) // 2
-split_A = Subset(real_ds, perm[:mid])
-split_B = Subset(real_ds, perm[mid:])
-
-ldr_A = DataLoader(split_A, batch_size=BATCH, shuffle=False,
-                   num_workers=8, pin_memory=True)
-ldr_B = DataLoader(split_B, batch_size=BATCH, shuffle=False,
-                   num_workers=8, pin_memory=True)
-
-chex_rr  = XRAYFID().to(metric_device)
-anat_rr  = AnatomicalFID().to(metric_device)
-
-with torch.no_grad():
-    for batch in ldr_A:                         # first half → “real”
-        imgs = batch["image"].to(device)
-        chex_rr.update(imgs, real=True)
-        anat_rr.update(imgs, real=True)
-
-    for batch in ldr_B:                         # second half → “fake”
-        imgs = batch["image"].to(device)
-        chex_rr.update(imgs, real=False)
-        anat_rr.update(imgs, real=False)
-
-print(f"\nXRAY-FID  real↔real  : {chex_rr.compute().item():.4f}")
-print(f"Anatomy-FID real↔real : {anat_rr.compute().item():.4f}")
-
-# ---------- 2. real vs white-noise ---------------------------------
-chex_rn  = XRAYFID().to(metric_device)
-anat_rn  = AnatomicalFID().to(metric_device)
-
-with torch.no_grad():
-    for batch in ldr_A:                         # reuse first split as “real”
-        imgs = batch["image"].to(device)
-        chex_rn.update(imgs, real=True)
-        anat_rn.update(imgs, real=True)
-
-        # create matching noise batch in [-1, 1]
-        noise = torch.randn_like(imgs).clamp_(-1, 1)
-        chex_rn.update(noise, real=False)
-        anat_rn.update(noise, real=False)
-
-print(f"XRAY-FID  real↔noise : {chex_rn.compute().item():.4f}")
-print(f"Anatomy-FID real↔noise: {anat_rn.compute().item():.4f}")

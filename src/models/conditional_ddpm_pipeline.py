@@ -13,7 +13,7 @@ class ConditionalDDPMPipeline(DDPMPipeline):
         num_inference_steps=1000,
         output_type="pil",
         class_labels=None,
-        guidance_scale=3.0,
+        guidance_scale=1.5,
         return_dict=True,
     ):
         # Initialize with random noise (exactly like original)

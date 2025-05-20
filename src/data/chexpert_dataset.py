@@ -86,7 +86,7 @@ class CheXpertDataset(Dataset):
 
         # Debug mode to use a small subset
         if debug_mode:
-            filtered_df = filtered_df.iloc[: min(5000, len(filtered_df))]
+            filtered_df = filtered_df.iloc[: min(100, len(filtered_df))]
 
         # Return the processed dataframe
         return filtered_df

@@ -296,7 +296,7 @@ def parse_args():
     parser.add_argument(
         "--guidance_scale",
         type=float,
-        default=1.0,
+        default=1.5,
         help="Guidance Scale for CFG",
     )
 
@@ -839,7 +839,7 @@ def main(args):
                     num_inference_steps=args.ddpm_num_inference_steps,
                     output_type="np",
                     class_labels=class_labels,
-                    guidance_scale=1.0,
+                    guidance_scale=args.guidance_scale,
                     )
                 else:
                     result = pipeline(
@@ -848,7 +848,7 @@ def main(args):
                         num_inference_steps=args.ddpm_num_inference_steps,
                         output_type="np",
                         class_labels=class_labels,
-                        guidance_scale=3.0,
+                        guidance_scale=args.guidance_scale,
                     )
                 images = result["images"]
 

@@ -107,7 +107,7 @@ class AmbientDDPMPipeline(DDPMPipeline):
         generator: Optional[torch.Generator] = None,
         num_inference_steps: int = 250,
         class_labels: Optional[torch.Tensor] = None,
-        guidance_scale: float = 3.0,
+        guidance_scale: float = 1.5,
         output_type: str = "pt",
         return_dict: bool = True,
     ):
